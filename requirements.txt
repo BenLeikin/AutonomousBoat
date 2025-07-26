@@ -1,0 +1,9 @@
+# core vision & numerics
+opencv-python
+numpy
+
+# camera interface
+picamera2
+
+# testing (optional)
+pytest
