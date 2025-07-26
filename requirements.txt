@@ -1,6 +1,0 @@
-# core vision & numerics
-opencv-python
-numpy
-
-# testing (optional)
-pytest
