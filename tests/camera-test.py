@@ -1,17 +1,18 @@
 #!/usr/bin/env python3
 """
 Simple script to capture a single image from the Raspberry Pi Camera
-and save it to the '/mnt/usb/test-photo' directory with a timestamped filename.
+and save it to the '/mnt/usb/test-photos' directory with a timestamped filename.
 """
 import os
 import sys
 import datetime
+import time
 
 from picamera2 import Picamera2
 import cv2
 
 # Directory where images will be stored
-SAVE_DIR = '/mnt/usb/test-photo'
+SAVE_DIR = '/mnt/usb/test-photos'
 
 
 def main():
@@ -31,8 +32,10 @@ def main():
     camera = Picamera2(camera_num=cam_num)
     config = camera.create_preview_configuration(main={'size': (640, 480)})
     camera.configure(config)
+
+    # Start the camera and give it a moment to warm up
     camera.start()
-    camera.wait_for_idle()
+    time.sleep(2)
 
     # Capture frame (RGB numpy array)
     frame = camera.capture_array()
