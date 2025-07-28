@@ -47,8 +47,8 @@ def main():
     filepath = os.path.join(SAVE_DIR, filename)
 
     # Convert RGB to BGR for OpenCV if needed
-    if frame.ndim == 3 and frame.shape[2] == 3:
-        frame = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
+#    if frame.ndim == 3 and frame.shape[2] == 3:
+#        frame = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
 
     # Write image to disk
     if not cv2.imwrite(filepath, frame):
