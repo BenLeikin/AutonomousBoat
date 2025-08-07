@@ -1,183 +1,179 @@
-# vision.py
-# Enhanced VisionProcessor with optional deep learning (YOLO) and improved background-subtraction pipeline
-
+#!/usr/bin/env python3
+"""
+VisionProcessor with robust ONNX detection, dynamic input-size handling,
+and scalar conversion fix. Always resizes to model's discovered input dimensions.
+"""
+import os
+import yaml
+import logging
 import cv2
 import numpy as np
-import sys
+import time
+import onnxruntime as ort
+from typing import List, Dict, Any, Optional, Any as AnyType
+
+# Load configuration
+CONFIG_PATH = os.path.join(os.path.dirname(__file__), 'config.yaml')
+try:
+    with open(CONFIG_PATH, 'r') as f:
+        cfg = yaml.safe_load(f) or {}
+except Exception:
+    cfg = {}
+
+vision_cfg = cfg.get('vision', {}) or {}
+detect_cfg = cfg.get('detection', {}) or {}
+
+logger = logging.getLogger(__name__)
 
 class VisionProcessor:
     """
-    VisionProcessor supports two modes of obstacle detection:
-      1) background subtraction + contour processing
-      2) deep learning via YOLO (OpenCV DNN)
-
-    Methods:
-      - detect(frame): returns a list of detections (contours or bboxes)
-      - annotate(frame, detections): overlays detection results on frame
+    Processes frames to detect obstacles using either background subtraction or ONNX DNN.
+    Always resizes input to the model's actual expected dimensions.
     """
+    def __init__(self) -> None:
+        # Timing and mode
+        self.method       = vision_cfg.get('method', 'bg')
+        self.input_scale  = float(vision_cfg.get('input_scale', 1.0))
+        self.target_fps   = float(vision_cfg.get('run_fps', 10))
+        self.min_interval = 1.0 / self.target_fps if self.target_fps > 0 else 0.0
+        self.last_time    = 0.0
 
-    def __init__(
-        self,
-        method='dnn',                 # 'dnn' for YOLO, 'bg' for background subtraction
-        # --- Background-subtraction params ---
-        min_area=5000,
-        history=500,
-        var_threshold=16,
-        # --- YOLO params with built-in defaults ---
-        yolo_cfg='models/yolo/yolov3-tiny.cfg',
-        yolo_weights='models/yolo/yolov3-tiny.weights',
-        yolo_names='models/yolo/coco.names',
-        input_size=(416, 416),
-        conf_threshold=0.5,
-        nms_threshold=0.4,
-        use_gpu=False
-    ):
-        self.method = method
-        self.min_area = min_area
+        # Background-subtractor settings
+        bg              = vision_cfg.get('bg', {})
+        self.bg_history = int(bg.get('history', 500))
+        self.bg_threshold = int(bg.get('var_threshold', 16))
+        self.bg_min_area = int(bg.get('min_area', 5000))
+        self.bg_sub      = None
 
-        # Background subtractor setup
-        if method == 'bg':
-            self._init_bg(history, var_threshold)
-            return
+        # DNN/ONNX settings
+        dnn             = vision_cfg.get('dnn', {})
+        self.onnx_path  = dnn.get('onnx_model') or detect_cfg.get('model_path', '')
+        self.conf_th    = float(dnn.get('conf_threshold', 0.5))
+        self.nms_th     = float(dnn.get('nms_threshold', 0.4))
+        self.use_gpu    = bool(dnn.get('use_gpu', False))
 
-        # YOLO DNN setup
-        if method == 'dnn':
-            try:
-                self.net = cv2.dnn.readNetFromDarknet(yolo_cfg, yolo_weights)
-            except cv2.error as e:
-                print(f"[Warning] Failed to load YOLO model: {e}. Falling back to background-subtraction.", file=sys.stderr)
-                self.method = 'bg'
-                self._init_bg(history, var_threshold)
-                return
+        # ONNX runtime placeholders
+        self.sess           : Optional[ort.InferenceSession] = None
+        self.input_name     : Optional[str] = None
+        self.layout         : Optional[str] = None  # 'NCHW' or 'NHWC'
+        self.model_input_hw : Optional[tuple[int,int]] = None  # (height, width)
 
-            if use_gpu:
-                self.net.setPreferableBackend(cv2.dnn.DNN_BACKEND_CUDA)
-                self.net.setPreferableTarget(cv2.dnn.DNN_TARGET_CUDA_FP16)
-            else:
-                self.net.setPreferableBackend(cv2.dnn.DNN_BACKEND_OPENCV)
-                self.net.setPreferableTarget(cv2.dnn.DNN_TARGET_CPU)
+        # Initialize pipeline
+        self._setup()
 
-            # Load class labels
-            try:
-                with open(yolo_names, 'r') as f:
-                    self.classes = [c.strip() for c in f.readlines()]
-            except Exception as e:
-                print(f"[Warning] Failed to load class names: {e}. DNN detections will show only IDs.", file=sys.stderr)
-                self.classes = None
+    def _setup(self) -> None:
+        if self.method == 'dnn' and self.onnx_path:
+            self._init_onnx()
+        else:
+            self.method = 'bg'
+            self._init_bg()
 
-            self.input_width, self.input_height = input_size
-            self.conf_threshold = conf_threshold
-            self.nms_threshold = nms_threshold
-
-    def _init_bg(self, history, var_threshold):
-        """Initialize background subtractor."""
-        self.backsub = cv2.createBackgroundSubtractorMOG2(
-            history=history,
-            varThreshold=var_threshold,
-            detectShadows=False
+    def _init_bg(self) -> None:
+        self.bg_sub = cv2.createBackgroundSubtractorMOG2(
+            history=self.bg_history, varThreshold=self.bg_threshold
         )
-        self.kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (5, 5))
+        logger.info("BG init: history=%d, varThreshold=%d, minArea=%d",
+                    self.bg_history, self.bg_threshold, self.bg_min_area)
 
-    def detect(self, frame):
-        """
-        Dispatch to the chosen detection method.
-        Returns:
-          - For 'bg': list of cv2 contours (hulls)
-          - For 'dnn': list of dicts {'bbox': (x,y,w,h), 'confidence': float, 'class_id': int, 'label': str}
-        """
+    def _init_onnx(self) -> None:
+        try:
+            providers = ['CPUExecutionProvider']
+            if self.use_gpu:
+                providers.insert(0, 'CUDAExecutionProvider')
+            self.sess = ort.InferenceSession(self.onnx_path, providers=providers)
+            inp = self.sess.get_inputs()[0]
+            self.input_name = inp.name
+            shp = inp.shape  # e.g. [None,3,640,640] or [None,640,640,3]
+            # Determine layout and dims
+            if len(shp) == 4 and shp[1] == 3:
+                self.layout = 'NCHW'
+                h_idx, w_idx = 2, 3
+            elif len(shp) == 4 and shp[3] == 3:
+                self.layout = 'NHWC'
+                h_idx, w_idx = 1, 2
+            else:
+                raise ValueError(f"Unsupported ONNX input shape {shp}")
+            # Store model's expected height/width
+            h = int(shp[h_idx]); w = int(shp[w_idx])
+            self.model_input_hw = (h, w)
+            logger.info("Loaded ONNX '%s' layout=%s inputHW=%s",
+                        self.onnx_path, self.layout, self.model_input_hw)
+        except Exception as e:
+            logger.warning("ONNX init failed (%s), falling back to BG", e)
+            self.method = 'bg'
+            self._init_bg()
+
+    def detect(self, frame: AnyType) -> List[Dict[str, Any]]:
+        """Detect obstacles; dispatch to BG or ONNX path."""
+        now = time.time()
+        if now - self.last_time < self.min_interval:
+            return []
+        self.last_time = now
+
+        # Downscale if requested
+        if self.input_scale != 1.0:
+            frame = cv2.resize(frame, None,
+                               fx=self.input_scale,
+                               fy=self.input_scale,
+                               interpolation=cv2.INTER_LINEAR)
+
         if self.method == 'bg':
             return self._detect_bg(frame)
         else:
-            return self._detect_dnn(frame)
+            return self._detect_onnx(frame)
 
-    def _detect_bg(self, frame):
-        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-        blur = cv2.GaussianBlur(gray, (5, 5), 0)
-        mask = self.backsub.apply(blur)
-        mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, self.kernel, iterations=2)
-        mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, self.kernel, iterations=2)
-        _, thresh = cv2.threshold(mask, 200, 255, cv2.THRESH_BINARY)
-        contours, _ = cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        processed = []
-        for cnt in contours:
-            if cv2.contourArea(cnt) < self.min_area:
-                continue
-            peri = cv2.arcLength(cnt, True)
-            approx = cv2.approxPolyDP(cnt, 0.02 * peri, True)
-            hull = cv2.convexHull(approx)
-            processed.append(hull)
-        return processed
+    def _detect_bg(self, frame: AnyType) -> List[Dict[str, Any]]:
+        mask = self.bg_sub.apply(frame)
+        cnts, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        return [{'contour': c} for c in cnts if cv2.contourArea(c) >= self.bg_min_area]
 
-    def _detect_dnn(self, frame):
-        blob = cv2.dnn.blobFromImage(
-            frame,
-            1/255.0,
-            (self.input_width, self.input_height),
-            swapRB=True,
-            crop=False
-        )
-        self.net.setInput(blob)
-        ln = self.net.getUnconnectedOutLayersNames()
-        layer_outputs = self.net.forward(ln)
+    def _detect_onnx(self, frame: AnyType) -> List[Dict[str, Any]]:
+        h0, w0 = frame.shape[:2]
+        # Ensure model_input_hw is set
+        if self.model_input_hw is None:
+            logger.warning("Model input size unknown, defaulting to 416x416")
+            self.model_input_hw = (416, 416)
+        h, w = self.model_input_hw
 
-        H, W = frame.shape[:2]
-        boxes, confidences, class_ids = [], [], []
-
-        # Parse detections
-        for output in layer_outputs:
-            for detection in output:
-                scores = detection[5:]
-                class_id = int(np.argmax(scores))
-                confidence = float(scores[class_id])
-                if confidence > self.conf_threshold:
-                    cx, cy, w, h = (detection[0:4] * [W, H, W, H]).astype('int')
-                    x = int(cx - w / 2)
-                    y = int(cy - h / 2)
-                    boxes.append([x, y, int(w), int(h)])
-                    confidences.append(confidence)
-                    class_ids.append(class_id)
-
-        # Apply Non-Maximum Suppression
-        idxs = cv2.dnn.NMSBoxes(boxes, confidences, self.conf_threshold, self.nms_threshold)
-        detections = []
-        if len(idxs) > 0:
-            for i in idxs.flatten():
-                x, y, w, h = boxes[i]
-                label = self.classes[class_ids[i]] if self.classes else str(class_ids[i])
-                detections.append({
-                    'bbox': (x, y, w, h),
-                    'confidence': confidences[i],
-                    'class_id': class_ids[i],
-                    'label': label
-                })
-        return detections
-
-    def annotate(self, frame, detections, color=(0, 255, 0), thickness=2):
-        """
-        Draws detections on the frame.
-        - For contours: draw the contour outline
-        - For DNN: draw bounding boxes and labels
-        """
-        if self.method == 'bg':
-            for cnt in detections:
-                cv2.drawContours(frame, [cnt], -1, color, thickness)
+        # Convert and resize to model size
+        blob = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        blob = cv2.resize(blob, (w, h))
+        blob = blob.astype(np.float32) / 255.0
+        if self.layout == 'NHWC':
+            blob = np.expand_dims(blob, axis=0)
         else:
-            for det in detections:
-                x, y, w, h = det['bbox']
-                label = f"{det['label']}:{det['confidence']:.2f}"
-                cv2.rectangle(frame, (x, y), (x + w, y + h), color, thickness)
-                cv2.putText(
-                    frame,
-                    label,
-                    (x, y - 10),
-                    cv2.FONT_HERSHEY_SIMPLEX,
-                    0.5,
-                    color,
-                    1
-                )
-        return frame
+            blob = np.transpose(blob, (2, 0, 1))[np.newaxis, ...]
 
-# If this module is run directly, instantiate with YOLO-tiny defaults
-if __name__ == '__main__':
-    vision = VisionProcessor()
-    print("VisionProcessor instantiated with method:", vision.method)
+        # Inference
+        outs = self.sess.run(None, {self.input_name: blob})
+        preds = np.array(outs[0][0])
+
+        # Post-process
+        boxes, scores = [], []
+        for det in preds:
+            # extract scalar values robustly
+            # confidence at index 4
+            conf_arr = det[4]
+            conf = float(conf_arr.item()) if isinstance(conf_arr, np.ndarray) else float(conf_arr)
+            if conf < self.conf_th:
+                continue
+            # bounding box center/size
+            vals = [det[i] for i in range(4)]
+            cx, cy, wr, hr = [float(v.item()) if isinstance(v, np.ndarray) else float(v) for v in vals]
+            x1 = int((cx - wr/2) * w0)
+            y1 = int((cy - hr/2) * h0)
+            x2 = int((cx + wr/2) * w0)
+            y2 = int((cy + hr/2) * h0)
+            boxes.append([x1, y1, x2 - x1, y2 - y1])
+            scores.append(conf)
+
+        idxs = cv2.dnn.NMSBoxes(boxes, scores, self.conf_th, self.nms_th)
+        return [
+            {
+                'bbox': (boxes[i][0], boxes[i][1], boxes[i][0] + boxes[i][2], boxes[i][1] + boxes[i][3]),
+                'confidence': scores[i]
+            }
+            for i in idxs.flatten()
+        ]
+
+# End of module

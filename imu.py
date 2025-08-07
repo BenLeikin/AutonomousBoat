@@ -1,115 +1,170 @@
-# imu.py
-# Module 9: IMU interface for Bosch LSM6DSOX (Modulin ABX00101)
+#!/usr/bin/env python3
+"""
+IMU interface for Bosch LSM6DSOX (Modulin ABX00101)
 
+Implements:
+1. Config-driven parameters (I2C bus/address, register values, calibration settings)
+2. Structured logging via Python's logging module
+3. Bulk I2C block reads for accel/gyro data
+4. Unit conversion during calibration and readings
+5. Type hints and docstrings for clarity
+6. Context-manager API for automatic resource cleanup
+7. Dynamic register configuration from config.yaml
+8. I2C error recovery with retries
+"""
+import os
+import yaml
+import logging
 import time
 import math
 from smbus2 import SMBus
+from typing import Dict, Any, Optional
 
-# I2C address and registers
-IMU_ADDR          = 0x6A
-WHO_AM_I          = 0x0F
-WHO_AM_I_EXPECTED = 0x6C
+# Load IMU configuration
+CONFIG_PATH = os.path.join(os.path.dirname(__file__), 'config.yaml')
+try:
+    with open(CONFIG_PATH, 'r') as f:
+        _full_cfg = yaml.safe_load(f)
+    _cfg: Dict[str, Any] = _full_cfg.get('imu', {}) or {}
+except Exception:
+    _cfg = {}
 
-CTRL1_XL = 0x10  # accel: ODR_XL[7:4], FS_XL[3:2]
-CTRL2_G  = 0x11  # gyro:  ODR_G[7:4],  FS_G[3:2]
+# Set up module logger
+logger = logging.getLogger(__name__)
 
-OUTX_L_G  = 0x22  # gyro X low byte
-OUTX_L_XL = 0x28  # accel X low byte
+# I2C and register constants
+IMU_ADDR = _cfg.get('address', 0x6A)
+WHO_AM_I_REG = 0x0F
+WHO_AM_I_EXPECTED = _cfg.get('who_am_i_expected', 0x6C)
+CTRL1_XL_ADDR = 0x10
+CTRL2_G_ADDR  = 0x11
+OUTX_L_G_ADDR  = 0x22
+OUTX_L_XL_ADDR = 0x28
 
-# Sensitivities
-ACCEL_SENSITIVITY = 0.061e-3 * 9.80665  # m/s² per LSB
-GYRO_SENSITIVITY  = 4.375e-3            # °/s per LSB
+# Block read settings
+def read_block(bus: SMBus, reg: int, length: int) -> bytes:
+    """
+    Read a block of bytes from the IMU with retries on failure.
+    """
+    retries = int(_cfg.get('retries', 3))
+    delay = float(_cfg.get('retry_delay', 0.01))
+    for attempt in range(1, retries+1):
+        try:
+            data = bus.read_i2c_block_data(IMU_ADDR, reg, length)
+            return data
+        except Exception as e:
+            logger.warning("I2C read error reg=0x%02X attempt=%d/%d: %s", reg, attempt, retries, e)
+            time.sleep(delay)
+    raise IOError(f"Failed to read {length} bytes from reg 0x{reg:02X}")
 
-# Gravity constant
-STANDARD_GRAVITY = 9.80665  # m/s²
 
-
-def twos_complement(val, bits=16):
+def twos_complement(val: int, bits: int =16) -> int:
+    """Convert raw integer to signed via two's complement."""
     if val & (1 << (bits - 1)):
-        return val - (1 << bits)
+        val -= (1 << bits)
     return val
 
 
-def read_raw(bus, reg_addr):
-    lo, hi = bus.read_i2c_block_data(IMU_ADDR, reg_addr, 2)
-    raw = (hi << 8) | lo
-    return twos_complement(raw)
-
-
-def read_accel_raw(bus):
-    return (
-        read_raw(bus, OUTX_L_XL),
-        read_raw(bus, OUTX_L_XL + 2),
-        read_raw(bus, OUTX_L_XL + 4),
-    )
-
-
-def read_gyro_raw(bus):
-    return (
-        read_raw(bus, OUTX_L_G),
-        read_raw(bus, OUTX_L_G + 2),
-        read_raw(bus, OUTX_L_G + 4),
-    )
-
 class IMU:
     """
-    IMU wraps Bosch LSM6DSOX (ABX00101) over I2C, handles init, calibration, and readings.
+    Context-manager for LSM6DSOX IMU over I2C.
+
+    Usage:
+        with IMU() as imu:
+            data = imu.read()
+            # data: {'ax':..., 'ay':..., 'az':..., 'gx':..., 'gy':..., 'gz':..., 'pitch':..., 'roll':...}
     """
-    def __init__(self, bus_id=1, calibrate_duration=5.0, calibrate_delay=0.01):
-        self.bus = SMBus(bus_id)
-        # Verify WHOAMI
-        whoami = self.bus.read_byte_data(IMU_ADDR, WHO_AM_I)
-        if whoami != WHO_AM_I_EXPECTED:
-            raise RuntimeError(f"IMU WHO_AM_I mismatch: 0x{whoami:02X}")
-        # Configure sensor: 104 Hz accel/gyro
-        self.bus.write_byte_data(IMU_ADDR, CTRL1_XL, 0x40)
-        self.bus.write_byte_data(IMU_ADDR, CTRL2_G,  0x40)
+    def __init__(self) -> None:
+        # Configuration parameters
+        self.bus_id = int(_cfg.get('bus_id', 1))
+        self.ctrl1_xl = int(_cfg.get('ctrl1_xl_value', 0x40))
+        self.ctrl2_g  = int(_cfg.get('ctrl2_g_value',  0x40))
+        cal = _cfg.get('calibrate', {})
+        self.cal_dur   = float(cal.get('duration', 5.0))
+        self.cal_delay = float(cal.get('delay', 0.01))
+        # Sensitivities
+        sens = _cfg.get('sensitivity', {})
+        self.acc_sens = float(sens.get('accel', 0.061e-3 * 9.80665))
+        self.gyro_sens= float(sens.get('gyro', 4.375e-3))
+        # Initialize bus
+        self.bus = SMBus(self.bus_id)
+
+    def __enter__(self) -> 'IMU':
+        self._verify()
+        self._configure()
+        self._calibrate()
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb) -> None:
+        self.close()
+
+    def _verify(self) -> None:
+        """Verify IMU identity via WHO_AM_I register."""
+        who = self.bus.read_byte_data(IMU_ADDR, WHO_AM_I_REG)
+        if who != WHO_AM_I_EXPECTED:
+            logger.error("IMU WHO_AM_I mismatch: got 0x%02X, expected 0x%02X", who, WHO_AM_I_EXPECTED)
+            raise RuntimeError("IMU not detected or wrong device")
+        logger.info("IMU detected: WHO_AM_I=0x%02X", who)
+
+    def _configure(self) -> None:
+        """Configure accelerometer and gyroscope control registers."""
+        self.bus.write_byte_data(IMU_ADDR, CTRL1_XL_ADDR, self.ctrl1_xl)
+        self.bus.write_byte_data(IMU_ADDR, CTRL2_G_ADDR,  self.ctrl2_g)
+        logger.info("Configured IMU: CTRL1_XL=0x%02X, CTRL2_G=0x%02X", self.ctrl1_xl, self.ctrl2_g)
         time.sleep(0.1)
-        # Calibrate biases
-        self._calibrate(calibrate_duration, calibrate_delay)
 
-    def _calibrate(self, duration, delay):
-        sums = {'ax':0,'ay':0,'az':0,'gx':0,'gy':0,'gz':0}
-        count = 0
-        start = time.time()
-        while time.time() - start < duration:
-            ax, ay, az = read_accel_raw(self.bus)
-            gx, gy, gz = read_gyro_raw(self.bus)
-            sums['ax'] += ax; sums['ay'] += ay; sums['az'] += az
-            sums['gx'] += gx; sums['gy'] += gy; sums['gz'] += gz
-            count += 1
-            time.sleep(delay)
-        # Store raw biases
-        self.bias = {k: v/count for k, v in sums.items()}
-        # Compute orientation offset
-        ax0 = self.bias['ax'] * ACCEL_SENSITIVITY
-        ay0 = self.bias['ay'] * ACCEL_SENSITIVITY
-        az0 = self.bias['az'] * ACCEL_SENSITIVITY
-        self.pitch_offset = math.degrees(math.atan2(ay0, math.sqrt(ax0*ax0 + az0*az0)))
-        self.roll_offset  = math.degrees(math.atan2(-ax0, az0))
+    def _calibrate(self) -> None:
+        """Compute biases over a time window in physical units."""
+        samples = int(self.cal_dur / self.cal_delay)
+        sums: Dict[str, float] = dict.fromkeys(['ax','ay','az','gx','gy','gz','pitch','roll'], 0.0)
+        for _ in range(samples):
+            d = self._read_raw_physical()
+            for k in sums:
+                sums[k] += d.get(k, 0.0)
+            time.sleep(self.cal_delay)
+        self.bias = {k: sums[k]/samples for k in sums}
+        # Offsets for orientation
+        self.pitch_offset = self.bias['pitch']
+        self.roll_offset  = self.bias['roll']
+        logger.info("IMU calibration complete: biases=%s", self.bias)
 
-    def read(self):
-        """
-        Return a dict with calibrated accel (m/s²), gyro (°/s), pitch and roll (°).
-        """
-        # Raw
-        ax_r, ay_r, az_r = read_accel_raw(self.bus)
-        gx_r, gy_r, gz_r = read_gyro_raw(self.bus)
-        # Scale
-        ax = ax_r * ACCEL_SENSITIVITY
-        ay = ay_r * ACCEL_SENSITIVITY
-        az = az_r * ACCEL_SENSITIVITY
-        gx = (gx_r - self.bias['gx']) * GYRO_SENSITIVITY
-        gy = (gy_r - self.bias['gy']) * GYRO_SENSITIVITY
-        gz = (gz_r - self.bias['gz']) * GYRO_SENSITIVITY
-        # Orientation
-        raw_pitch = math.degrees(math.atan2(ay, math.sqrt(ax*ax + az*az)))
-        raw_roll  = math.degrees(math.atan2(-ax, az))
-        pitch = raw_pitch - self.pitch_offset
-        roll  = raw_roll  - self.roll_offset
-        return {'ax': ax, 'ay': ay, 'az': az,
-                'gx': gx, 'gy': gy, 'gz': gz,
-                'pitch': pitch, 'roll': roll}
+    def _read_raw(self) -> Dict[str, int]:
+        """Read raw accelerometer and gyroscope counts via block reads."""
+        # Accelerometer: 6 bytes
+        arb = read_block(self.bus, OUTX_L_XL_ADDR, 6)
+        ax_r = twos_complement(arb[1] << 8 | arb[0])
+        ay_r = twos_complement(arb[3] << 8 | arb[2])
+        az_r = twos_complement(arb[5] << 8 | arb[4])
+        # Gyroscope: 6 bytes
+        grb = read_block(self.bus, OUTX_L_G_ADDR, 6)
+        gx_r = twos_complement(grb[1] << 8 | grb[0])
+        gy_r = twos_complement(grb[3] << 8 | grb[2])
+        gz_r = twos_complement(grb[5] << 8 | grb[4])
+        return {'ax':ax_r,'ay':ay_r,'az':az_r,'gx':gx_r,'gy':gy_r,'gz':gz_r}
 
-    def close(self):
+    def _read_raw_physical(self) -> Dict[str, float]:
+        """Convert raw counts to physical units and compute orientation."""
+        r = self._read_raw()
+        ax = r['ax'] * self.acc_sens
+        ay = r['ay'] * self.acc_sens
+        az = r['az'] * self.acc_sens
+        gx = r['gx'] * self.gyro_sens
+        gy = r['gy'] * self.gyro_sens
+        gz = r['gz'] * self.gyro_sens
+        pitch = math.degrees(math.atan2(ay, math.sqrt(ax*ax+az*az)))
+        roll  = math.degrees(math.atan2(-ax, az))
+        return {'ax':ax,'ay':ay,'az':az,'gx':gx,'gy':gy,'gz':gz,'pitch':pitch,'roll':roll}
+
+    def read(self) -> Dict[str, float]:
+        """Return calibrated sensor readings and orientation."""
+        phys = self._read_raw_physical()
+        # Subtract biases
+        result = {k: phys[k] - self.bias.get(k, 0.0) for k in phys}
+        # Adjust orientation offsets
+        result['pitch'] = result['pitch'] - self.pitch_offset
+        result['roll']  = result['roll']  - self.roll_offset
+        return result
+
+    def close(self) -> None:
+        """Close the I2C bus connection."""
         self.bus.close()

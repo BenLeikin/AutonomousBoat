@@ -1,55 +1,70 @@
-# logger.py
-# Module 6: CSV + console logging utilities for LiDAR and obstacle counts
+#!/usr/bin/env python3
+"""
+Logging configuration for AutonomousBoat
 
-import csv
-import sys
-from datetime import datetime
+This module sets up Python's logging with both console and rotating-file handlers,
+using parameters from config.yaml. File logs are emitted in JSON format for easy parsing.
+"""
+import os
+import yaml
+import logging
+import json
+from logging.handlers import RotatingFileHandler
 
-class Logger:
-    """
-    Logger handles writing LiDAR distance readings to a CSV file and
-    printing obstacle counts or other information to the console.
-    """
-    def __init__(self, csv_path):
-        """
-        Initialize the CSV writer and write the header.
-        csv_path: filesystem path to output CSV log
-        """
-        self.csv_path = csv_path
-        try:
-            self.csv_file = open(csv_path, 'w', newline='')
-            self.csv_writer = csv.writer(self.csv_file)
-            # Write CSV header
-            self.csv_writer.writerow(['timestamp', 'lidar_distance_m'])
-        except Exception as e:
-            print(f"Error: could not open CSV log at {csv_path}: {e}", file=sys.stderr)
-            self.csv_file = None
-            self.csv_writer = None
+# Load logging configuration
+CONFIG_PATH = os.path.join(os.path.dirname(__file__), 'config.yaml')
+try:
+    with open(CONFIG_PATH, 'r') as f:
+        _full_cfg = yaml.safe_load(f)
+    _log_cfg = _full_cfg.get('logging', {}) or {}
+except Exception:
+    _log_cfg = {}
 
-    def log_lidar(self, distance):
-        """
-        Log a LiDAR distance reading to the CSV file, timestamped.
-        distance: float in meters (or None)
-        """
-        if self.csv_writer:
-            timestamp = datetime.now().isoformat()
-            self.csv_writer.writerow([timestamp, '' if distance is None else f"{distance:.3f}"])
-            self.csv_file.flush()
+# Ensure output folder exists
+_output_folder = _log_cfg.get('output_folder', 'logs/')
+os.makedirs(_output_folder, exist_ok=True)
 
-    def log_console(self, obstacle_count):
-        """
-        Print obstacle count information to the console.
-        obstacle_count: integer number of detected obstacles
-        """
-        timestamp = datetime.now().strftime('%H:%M:%S')
-        print(f"[{timestamp}] Obstacles detected: {obstacle_count}")
+# Determine log level
+_level = getattr(logging, _log_cfg.get('level', 'INFO').upper(), logging.INFO)
 
-    def close(self):
-        """
-        Close the CSV file if open.
-        """
-        if self.csv_file:
-            try:
-                self.csv_file.close()
-            except Exception:
-                pass
+# Configure root logger
+_logger = logging.getLogger()
+_logger.setLevel(_level)
+
+# Console handler
+_ch = logging.StreamHandler()
+_ch.setLevel(_level)
+_console_fmt = logging.Formatter('%(asctime)s [%(levelname)s] %(message)s')
+_ch.setFormatter(_console_fmt)
+_logger.addHandler(_ch)
+
+# Rotating file handler with JSON output
+_log_file = os.path.join(_output_folder, 'autonomous_boat.log')
+_fh = RotatingFileHandler(_log_file,
+                          maxBytes=_log_cfg.get('max_bytes', 5_000_000),
+                          backupCount=_log_cfg.get('backup_count', 3))
+_fh.setLevel(_level)
+
+class _JsonFormatter(logging.Formatter):
+    def format(self, record: logging.LogRecord) -> str:
+        data = {
+            'timestamp': self.formatTime(record, self.datefmt),
+            'level': record.levelname,
+            'message': record.getMessage(),
+        }
+        # include any extra fields if provided
+        if hasattr(record, 'extra_data'):
+            data.update(record.extra_data)
+        return json.dumps(data)
+
+_json_fmt = _JsonFormatter()
+_fh.setFormatter(_json_fmt)
+_logger.addHandler(_fh)
+
+# Expose the configured logger
+logger = _logger
+
+# Convenience function for structured logging
+def log_structured(level: int, msg: str, **extra_data) -> None:
+    """Log a message with additional structured data."""
+    _logger.log(level, msg, extra={'extra_data': extra_data})
