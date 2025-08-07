@@ -1,0 +1,113 @@
+# Configuration file for AutonomousBoat parameters
+
+# Camera settings
+camera:
+  frame_width: 640            # Width of the captured frame
+  frame_height: 480           # Height of the captured frame
+  fps: 30                     # Frames per second
+  warmup: 2                   # Seconds to warm up the camera
+
+# Vision processing settings
+vision:
+  method: dnn                 # 'bg' for background subtraction or 'dnn' for YOLO
+  input_scale: 0.5            # Downscale factor for input frames
+  run_fps: 10                 # Target processing rate (frames per second)
+  bg:
+    min_area: 5000            # Minimum contour area for BG subtraction mode
+    history: 500              # History length for MOG2
+    var_threshold: 16         # Variance threshold for MOG2
+  dnn:
+    yolo_cfg: "models/yolo/yolov3-tiny.cfg"        # Path to YOLO config
+    yolo_weights: "models/yolo/yolov3-tiny.weights"  # Path to YOLO weights
+    yolo_names: "models/yolo/coco.names"           # Path to class names
+    input_size: [416, 416]    # DNN input dimensions [width, height]
+    conf_threshold: 0.5       # Confidence threshold for detections
+    nms_threshold: 0.4        # NMS IoU threshold
+    use_gpu: false            # Enable CUDA backend if available
+
+# Annotator styles
+annotator:
+  text:
+    font: "FONT_HERSHEY_SIMPLEX"
+    scale: 0.6
+    color: [255, 255, 255]
+    thickness: 2
+    position: [10, 30]
+  heading:
+    color: [255, 255, 255]
+    thickness: 2
+    tip_length: 0.2
+    length_ratio: 0.25
+  action:
+    position: [10, 80]
+    color: [0, 255, 255]
+    scale: 0.6
+    thickness: 2
+  axes:
+    length_ratio: 0.2
+    thickness: 2
+    tip_length: 0.2
+    x_color: [0, 0, 255]
+    y_color: [0, 255, 0]
+    z_color: [255, 0, 0]
+  histogram:
+    height: 10
+    free_color: [0, 255, 0]
+    occ_color: [0, 0, 255]
+
+# Object detection settings (legacy)
+detection:
+  model_path: "models/yolov5s.onnx"    # Path to ONNX model
+  confidence_threshold: 0.5            # Min. confidence for YOLOv5
+  nms_iou_threshold: 0.4               # IoU threshold for NMS
+  min_contour_area: 500                # Min. box area for filtering
+
+# Avoidance behavior
+avoidance:
+  target_obstacle_distance: 1.0      # Desired distance from obstacle (m)
+  max_turn_rate: 30                  # Max turning rate (deg/s)
+  forward_speed: 0.5                 # Forward speed (m/s)
+  turn_speed: 0.3                    # Speed factor during turns
+
+# PID control parameters
+pid:
+  p_gain: 1.0
+  i_gain: 0.0
+  d_gain: 0.1
+
+# IMU (LSM6DSOX) settings
+imu:
+  bus_id: 1                         # I2C bus number
+  address: 106                      # I2C address (0x6A)
+  who_am_i_expected: 108            # WHO_AM_I expected response (0x6C)
+  ctrl1_xl_value: 64                # CTRL1_XL register value (0x40)
+  ctrl2_g_value: 64                 # CTRL2_G register value  (0x40)
+  calibrate:
+    duration: 5.0                   # Calibration duration (s)
+    delay: 0.01                     # Delay between samples (s)
+  retries: 3                        # I2C read retry attempts
+  retry_delay: 0.01                 # Delay between I2C retries (s)
+
+# Navigation settings
+navigation:
+  num_sectors: 36                  # Number of angular sectors for histogram
+  min_gap_width: 3                 # Minimum free sectors to consider a gap
+  wall_margin_frac: 0.05           # Fraction of frame edge to treat as wall
+  angle_threshold_rad: 0.1745      # Radians within which to go straight (~10°)
+  loop_delay: 0.1                  # Delay between loop iterations (s)
+  stuck:
+    window_sec: 2.0                # Time window for stuck detection (s)
+    motion_thresh: 0.01            # Acceleration threshold below which is “no motion” (m/s²)
+    reverse_dur: 1.0               # Duration to reverse when stuck (s)
+
+# Logging and debug
+logging:
+  level: "INFO"                    # DEBUG, INFO, WARNING, ERROR
+  save_frames: false               # Save debug frames to disk
+  output_folder: "logs/"           # Log directory
+
+# General boat parameters
+boat:
+  wheel_base: 0.3                  # Distance between thrusters (m)
+  max_speed: 1.0                   # Max speed (m/s)
+  min_speed: 0.1                   # Min forward speed (m/s)
