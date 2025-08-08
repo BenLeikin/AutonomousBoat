@@ -1,31 +1,71 @@
-# Configuration file for AutonomousBoat parameters
+# AutonomousBoat — master configuration
 
-# Camera settings
+# ───────── Camera (PiCam / libcamera) ─────────
 camera:
-  frame_width: 640            # Width of the captured frame
-  frame_height: 480           # Height of the captured frame
-  fps: 30                     # Frames per second
-  warmup: 2                   # Seconds to warm up the camera
+  frame_width: 640
+  frame_height: 480
+  fps: 60                 # run the sensor faster so vision gets more frames
+  warmup: 2
 
-# Vision processing settings
+  # White balance / color controls
+  awb:
+    mode: "grayworld"     # auto | daylight | cloudy | tungsten | fluorescent | indoor | manual | grayworld
+    gains: [1.20, 1.90]   # only used when mode=manual
+  color:
+    brightness: 0.0
+    contrast: 1.0
+    saturation: 1.1
+    sharpness: 1.0
+  denoise: "off"          # off | fast | high_quality | minimal | zsl | (omit/auto to skip setting)
+
+# ───────── Vision (detection) ─────────
 vision:
-  method: dnn                 # 'bg' for background subtraction or 'dnn' for YOLO
-  input_scale: 0.5            # Downscale factor for input frames
-  run_fps: 10                 # Target processing rate (frames per second)
-  bg:
-    min_area: 5000            # Minimum contour area for BG subtraction mode
-    history: 500              # History length for MOG2
-    var_threshold: 16         # Variance threshold for MOG2
-  dnn:
-    yolo_cfg: "models/yolo/yolov3-tiny.cfg"        # Path to YOLO config
-    yolo_weights: "models/yolo/yolov3-tiny.weights"  # Path to YOLO weights
-    yolo_names: "models/yolo/coco.names"           # Path to class names
-    input_size: [416, 416]    # DNN input dimensions [width, height]
-    conf_threshold: 0.5       # Confidence threshold for detections
-    nms_threshold: 0.4        # NMS IoU threshold
-    use_gpu: false            # Enable CUDA backend if available
+  method: classical
+  debug: true
+  classical:
+    # make edges less hair-trigger
+    clahe: {clip: 2.0, grid: 8}
+    blur_ksize: 3
+    canny:
+      adaptive: false
+      low: 40
+      high: 120
 
-# Annotator styles
+    # stop bridging *everything*
+    morph:
+      open: 0
+      open_iter: 0
+      close: 3
+      close_iter: 1
+
+    # ignore micro-blobs and skinny lines
+    contour:
+      min_area_px: 3000
+      min_aspect: 0.08         # allow but not hairline
+
+    # hough: require longer lines
+    hough:
+      enabled: true
+      min_line_frac: 0.55
+      theta_tol_deg: 12
+      threshold: 30
+      max_gap: 12
+      thickness: 3
+
+    # motion: a bit steadier
+    motion:
+      enabled: true
+      learning_rate: 0.002
+      min_area_px: 2200
+
+    # flow: keep, but not hyper-twitchy
+    flow:
+      enabled: true
+      mag_thresh_px: 1.5
+      roi_corridor_frac: 0.70
+      roi_band_frac: 0.58
+
+# ───────── Annotator (on-video overlays) ─────────
 annotator:
   text:
     font: "FONT_HERSHEY_SIMPLEX"
@@ -54,60 +94,103 @@ annotator:
     height: 10
     free_color: [0, 255, 0]
     occ_color: [0, 0, 255]
+  det:
+    box_color: [0, 255, 255]
+    box_thickness: 2
+    contour_color: [0, 255, 255]
+    text_color: [0, 255, 255]
 
-# Object detection settings (legacy)
-detection:
-  model_path: "models/yolov5s.onnx"    # Path to ONNX model
-  confidence_threshold: 0.5            # Min. confidence for YOLOv5
-  nms_iou_threshold: 0.4               # IoU threshold for NMS
-  min_contour_area: 500                # Min. box area for filtering
-
-# Avoidance behavior
-avoidance:
-  target_obstacle_distance: 1.0      # Desired distance from obstacle (m)
-  max_turn_rate: 30                  # Max turning rate (deg/s)
-  forward_speed: 0.5                 # Forward speed (m/s)
-  turn_speed: 0.3                    # Speed factor during turns
-
-# PID control parameters
-pid:
-  p_gain: 1.0
-  i_gain: 0.0
-  d_gain: 0.1
-
-# IMU (LSM6DSOX) settings
+# ───────── IMU (LSM6DSOX) ─────────
 imu:
-  bus_id: 1                         # I2C bus number
-  address: 106                      # I2C address (0x6A)
-  who_am_i_expected: 108            # WHO_AM_I expected response (0x6C)
-  ctrl1_xl_value: 64                # CTRL1_XL register value (0x40)
-  ctrl2_g_value: 64                 # CTRL2_G register value  (0x40)
+  bus_id: 1
+  address: 106                  # 0x6A
+  who_am_i_expected: 108        # 0x6C
+  ctrl1_xl_value: 64            # 0x40
+  ctrl2_g_value: 64             # 0x40
   calibrate:
-    duration: 5.0                   # Calibration duration (s)
-    delay: 0.01                     # Delay between samples (s)
-  retries: 3                        # I2C read retry attempts
-  retry_delay: 0.01                 # Delay between I2C retries (s)
+    duration: 5.0
+    delay: 0.01
+  retries: 3
+  retry_delay: 0.01
 
-# Navigation settings
+# ───────── Navigation (reactive policy) ─────────
 navigation:
-  num_sectors: 36                  # Number of angular sectors for histogram
-  min_gap_width: 3                 # Minimum free sectors to consider a gap
-  wall_margin_frac: 0.05           # Fraction of frame edge to treat as wall
-  angle_threshold_rad: 0.1745      # Radians within which to go straight (~10°)
-  loop_delay: 0.1                  # Delay between loop iterations (s)
+  mode: "reactive_90"           # forward until blocked → 90° turn
+  loop_delay: 0.01              # smaller = faster loop (bounded by camera FPS)
+
+  # Pre-roll analysis before moving
+  preroll_sec: 5.0
+  preroll_blocked_ratio: 0.4
+
+  # Forward collision “zone” (image-space)
+  forward_corridor_frac: 0.75   # widen for easier wall detection
+  forward_band_frac: 0.60       # higher = closer-to-boat zone
+  min_bbox_height_frac: 0.25
+
+  # (Legacy nav edge fallback — we rely on vision.classical now)
+  edge_fallback:
+    enabled: false
+    canny1: 60
+    canny2: 180
+    clahe_clip: 2.0
+    clahe_grid: 8
+    open_kernel: 3
+    enter_density: 0.06
+    exit_density: 0.03
+    use_hough: true
+    hough_min_line_frac: 0.60
+    hough_theta_tol_deg: 15
+    hough_threshold: 30
+    hough_max_gap: 10
+
+  # Turn behavior
+  default_turn: "right"
+  turn_90_duration_s: 0.8
+  post_turn_coast_s: 1.0
+
+  # Viz-only parameters (don’t affect behavior)
+  num_sectors: 36
+  min_gap_width: 3
+  wall_margin_frac: 0.05
+  angle_threshold_rad: 0.1745    # ~10°
+
+  # Stuck detection (gyro/accel)
   stuck:
-    window_sec: 2.0                # Time window for stuck detection (s)
-    motion_thresh: 0.01            # Acceleration threshold below which is “no motion” (m/s²)
-    reverse_dur: 1.0               # Duration to reverse when stuck (s)
+    enabled: true
+    window_sec: 1.5
+    yaw_rate_thresh_dps: 4.0
+    use_accel: true
+    accel_thresh: 0.05
+    reverse_dur: 0.5
 
-# Logging and debug
+# ───────── Logging & “thoughts” ─────────
 logging:
-  level: "INFO"                    # DEBUG, INFO, WARNING, ERROR
-  save_frames: false               # Save debug frames to disk
-  output_folder: "logs/"           # Log directory
+  level: "INFO"
+  save_frames: false
+  output_folder: "logs/"
+  thoughts:
+    console: true
+    console_level: "DEBUG"
+    overlay: true
+    max_overlay_lines: 4
 
-# General boat parameters
+# ───────── Recording (annotated video) ─────────
+recording:
+  enabled: true               # off while we debug/max FPS; turn on later
+  dir: "/mnt/usb"
+  dir_fallback: "logs"
+  filename_prefix: "annotated"
+  fps: 0                       # 0 = match loop FPS (avoids time-lapse feel)
+  fourcc: "mp4v"
+  annotate:
+    detections: true
+    heading: true
+    histogram: true
+    action: true
+    axes: false
+
+# ───────── Boat constants (future use) ─────────
 boat:
-  wheel_base: 0.3                  # Distance between thrusters (m)
-  max_speed: 1.0                   # Max speed (m/s)
-  min_speed: 0.1                   # Min forward speed (m/s)
+  wheel_base: 0.3
+  max_speed: 1.0
+  min_speed: 0.1

@@ -64,7 +64,7 @@ def read_gyro(bus):
     )
 
 
-def calibrate(bus, duration=10.0, delay=0.01):
+def calibrate(bus, duration=0.0, delay=0.01):
     """Collect readings for `duration` seconds while stationary to compute raw biases."""
     logging.info(f"Calibrating for {duration:.1f} seconds (stationary)...")
     sums = {'ax':0, 'ay':0, 'az':0, 'gx':0, 'gy':0, 'gz':0}
