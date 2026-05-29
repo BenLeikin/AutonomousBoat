@@ -1,93 +1,141 @@
 # AutonomousBoat
 
+Vision-based autonomous RC boat for swimming pool navigation. Uses a Raspberry Pi 4 with a CSI camera and an I2C IMU to detect obstacles (walls, floating objects, people) and steer around them with differential thrust.
 
+## Hardware
 
-## Getting started
+- **Raspberry Pi 4 Model B** running Raspberry Pi OS Trixie (64-bit)
+- **Pi Camera v1** (OmniVision OV5647, 5MP, CSI ribbon)
+- **LSM6DSO IMU** (6-axis accel + gyro, I2C address `0x6A`)
+- Hull: AliExpress 2.4G twin-motor RC racing boat, stock electronics replaced
+- Motor driver: TBD (DRV8833 or TB6612FNG)
+- Buck converter: TBD (MP1584EN, 5.1V output)
+- Battery: TBD (2S 7.4V LiPo)
 
-To make it easy for you to get started with GitLab, here's a list of recommended next steps.
+## Software setup
 
-Already a pro? Just edit this README.md and make it your own. Want to make it easy? [Use the template at the bottom](#editing-this-readme)!
+Assumes a fresh Pi OS Trixie install.
 
-## Add your files
+### System packages
 
-* [Create](https://docs.gitlab.com/user/project/repository/web_editor/#create-a-file) or [upload](https://docs.gitlab.com/user/project/repository/web_editor/#upload-a-file) files
-* [Add files using the command line](https://docs.gitlab.com/topics/git/add_files/#add-files-to-a-git-repository) or push an existing Git repository with the following command:
+```bash
+sudo apt install -y i2c-tools python3-dev python3-picamera2 python3-rpi-lgpio
+sudo raspi-config nonint do_i2c 0
+echo "i2c-dev" | sudo tee -a /etc/modules
+```
+
+### Python environment
+
+```bash
+cd ~
+python3 -m venv --system-site-packages autoboat-env
+source autoboat-env/bin/activate
+pip install \
+    adafruit-circuitpython-lsm6ds \
+    adafruit-circuitpython-busdevice \
+    adafruit-circuitpython-register \
+    adafruit-platformdetect \
+    Adafruit-PureIO \
+    opencv-python-headless \
+    Pillow
+pip install --no-deps adafruit-blinka
+```
+
+`--system-site-packages` lets the venv see the apt-installed `picamera2`.
+`--no-deps` on `adafruit-blinka` skips `rpi_ws281x` and `RPi.GPIO` which conflict with the modern `rpi-lgpio` on Trixie. The IMU only uses I2C so neither is needed.
+
+### Verify
+
+```bash
+source ~/autoboat-env/bin/activate
+python3 -c "from picamera2 import Picamera2; from adafruit_lsm6ds.lsm6dsox import LSM6DSOX; import board, busio; print('ok')"
+```
+
+## Project structure
 
 ```
-cd existing_repo
-git remote add origin http://gitlab.pilg0re.net/Ben/autonomousboat.git
-git branch -M main
-git push -uf origin main
+autoboat/
+├── sensors/
+│   ├── imu.py              # Threaded LSM6DSO reader, ~100 Hz
+│   └── camera.py           # Threaded Picamera2 wrapper, ~30 fps
+├── vision/
+│   └── pipeline.py         # HSV water segmentation, per-column depth, zone analysis
+├── control/                # (not yet implemented)
+├── scripts/
+│   ├── sensor_rates.py     # Measure achieved IMU + camera rates
+│   ├── capture_pool_images.py  # Capture labeled pool test images
+│   └── test_pipeline.py    # Run vision pipeline on saved images
+├── pool_images/            # Test images of the pool in various conditions
+└── logs/                   # Runtime logs (gitignored)
 ```
 
-## Integrate with your tools
+## Running the scripts
 
-* [Set up project integrations](http://gitlab.pilg0re.net/Ben/autonomousboat/-/settings/integrations)
+All scripts assume the venv is active and you're running as user `ben` (in the `i2c`, `gpio`, `video` groups).
 
-## Collaborate with your team
+**Measure sensor rates:**
+```bash
+python3 ~/autoboat/scripts/sensor_rates.py
+```
+Runs both sensors for 5 seconds and reports actual achieved Hz/fps.
 
-* [Invite team members and collaborators](https://docs.gitlab.com/user/project/members/)
-* [Create a new merge request](https://docs.gitlab.com/user/project/merge_requests/creating_merge_requests/)
-* [Automatically close issues from merge requests](https://docs.gitlab.com/user/project/issues/managing_issues/#closing-issues-automatically)
-* [Enable merge request approvals](https://docs.gitlab.com/user/project/merge_requests/approvals/)
-* [Set auto-merge](https://docs.gitlab.com/user/project/merge_requests/auto_merge/)
+**Capture pool test images:**
+```bash
+python3 ~/autoboat/scripts/capture_pool_images.py
+```
+Interactive. Prompts for a label, captures a frame, writes a timestamped JPEG to `pool_images/`.
 
-## Test and Deploy
+**Run the vision pipeline on saved images:**
+```bash
+python3 ~/autoboat/scripts/test_pipeline.py
+```
+Analyzes every JPEG in `pool_images/` and writes annotated output to `pool_images/analyzed/`.
 
-Use the built-in continuous integration in GitLab.
+## Vision pipeline output
 
-* [Get started with GitLab CI/CD](https://docs.gitlab.com/ci/quick_start/)
-* [Analyze your code for known vulnerabilities with Static Application Security Testing (SAST)](https://docs.gitlab.com/user/application_security/sast/)
-* [Deploy to Kubernetes, Amazon EC2, or Amazon ECS using Auto Deploy](https://docs.gitlab.com/topics/autodevops/requirements/)
-* [Use pull-based deployments for improved Kubernetes management](https://docs.gitlab.com/user/clusters/agent/)
-* [Set up protected environments](https://docs.gitlab.com/ci/environments/protected_environments/)
+The pipeline returns a `NavResult` for each frame:
 
-***
+- `mask`: binary water mask
+- `depths`: per-column free-water depth in pixels (length = frame width)
+- `zones`: 5 horizontal zones with median water depth, left to right
+- `best_zone`: zone index (0-4) with the most open water
+- `center_depth_pct`: free water ahead in the center column, as % of frame height
 
-# Editing this README
+Steering logic (when implemented): turn toward `best_zone`, reduce speed when `center_depth_pct` drops below a threshold.
 
-When you're ready to make this README your own, just edit this file and use the handy template below (or feel free to structure it however you want - this is just a starting point!). Thanks to [makeareadme.com](https://www.makeareadme.com/) for this template.
+## Sensor architecture
 
-## Suggestions for a good README
+Both sensors run in their own thread with a "latest sample wins" pattern. Consumers call `latest()` and get the most recent reading. No queues, no locks.
 
-Every project is different, so consider which of these sections apply to yours. The sections used in the template are suggestions for most open source projects. Also keep in mind that while a README can be too long and detailed, too long is better than too short. If you think your README is too long, consider utilizing another form of documentation rather than cutting out information.
+- IMU: ~100 Hz, sample age < 10 ms
+- Camera: ~32 fps at 320x240, frame age < 32 ms
 
-## Name
-Choose a self-explaining name for your project.
+Verified via `scripts/sensor_rates.py`.
 
-## Description
-Let people know what your project can do specifically. Provide context and add a link to any reference visitors might be unfamiliar with. A list of Features or a Background subsection can also be added here. If there are alternatives to your project, this is a good place to list differentiating factors.
+## Status
 
-## Badges
-On some READMEs, you may see small images that convey metadata, such as whether or not all the tests are passing for the project. You can use Shields to add some to your README. Many services also have instructions for adding a badge.
+Working:
+- Camera detected and streaming via Picamera2
+- IMU detected, reading clean accel + gyro
+- Threaded sensor layer hits target rates
+- Vision pipeline correctly identifies water vs obstacles in cloudy outdoor light
 
-## Visuals
-Depending on what you are making, it can be a good idea to include screenshots or even a video (you'll frequently see GIFs rather than actual videos). Tools like ttygif can help, but check out Asciinema for a more sophisticated method.
+Not yet implemented:
+- Motor driver hardware and software
+- Control loop
+- Live demo (pipeline against the threaded camera in real time)
+- Sunny-condition HSV recalibration
+- Temporal smoothing on steering output
+- Distance calibration (pixel rows -> meters)
+- Hardware watchdog for motor cutoff on control hang
+- Waterproof enclosure
 
-## Installation
-Within a particular ecosystem, there may be a common way of installing things, such as using Yarn, NuGet, or Homebrew. However, consider the possibility that whoever is reading your README is a novice and would like more guidance. Listing specific steps helps remove ambiguity and gets people to using your project as quickly as possible. If it only runs in a specific context like a particular programming language version or operating system or has dependencies that have to be installed manually, also add a Requirements subsection.
+## Calibration notes
 
-## Usage
-Use examples liberally, and show the expected output if you can. It's helpful to have inline the smallest example of usage that you can demonstrate, while providing links to more sophisticated examples if they are too long to reasonably include in the README.
+HSV thresholds in `vision/pipeline.py` are tuned for the OV5647 under cloudy evening light. The camera's auto white balance produces an olive-green color cast for clear pool water (visible in `pool_images/`). Thresholds are matched to what the camera actually outputs, not what the water looks like to the eye.
 
-## Support
-Tell people where they can go to for help. It can be any combination of an issue tracker, a chat room, an email address, etc.
-
-## Roadmap
-If you have ideas for releases in the future, it is a good idea to list them in the README.
-
-## Contributing
-State if you are open to contributions and what your requirements are for accepting them.
-
-For people who want to make changes to your project, it's helpful to have some documentation on how to get started. Perhaps there is a script that they should run or some environment variables that they need to set. Make these steps explicit. These instructions could also be useful to your future self.
-
-You can also document commands to lint the code or run tests. These steps help to ensure high code quality and reduce the likelihood that the changes inadvertently break something. Having instructions for running tests is especially helpful if it requires external setup, such as starting a Selenium server for testing in a browser.
-
-## Authors and acknowledgment
-Show your appreciation to those who have contributed to the project.
+When lighting changes significantly (midday sun, indoor), recalibration via pixel sampling from new images is needed. Use `analyze_water.py`-style sampling to get new percentile ranges.
 
 ## License
-For open source projects, say how it is licensed.
 
-## Project status
-If you have run out of energy or time for your project, put a note at the top of the README saying that development has slowed down or stopped completely. Someone may choose to fork your project or volunteer to step in as a maintainer or owner, allowing your project to keep going. You can also make an explicit request for maintainers.
+Personal project. No license specified.
