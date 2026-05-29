@@ -1,0 +1,22 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+
+# Virtual environments (in case one ever ends up inside the project)
+venv/
+.venv/
+env/
+*-env/
+
+# Editors
+.vscode/
+.idea/
+*.swp
+*.swo
+.DS_Store
+
+# Local-only secrets / config
+.env
+*.local
