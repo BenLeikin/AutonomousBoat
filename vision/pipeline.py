@@ -7,9 +7,6 @@ Takes a BGR or RGB frame, returns a navigation summary:
   - zones: 5 horizontal zones with median water depth
   - best_zone: index of zone with most open water (0=leftmost, 4=rightmost)
   - center_depth_pct: free water ahead in the center column, as % of frame height
-
-The HSV thresholds are tuned for the OV5647 camera under cloudy outdoor light
-and will need recalibration for sunny conditions.
 """
 from dataclasses import dataclass
 import cv2
@@ -23,14 +20,8 @@ DEFAULT_THRESHOLDS = {
     "v_lo": 60, "v_hi": 240,
 }
 
-# Consecutive non-water rows allowed (after we've started seeing water)
-# before declaring an obstacle.
 GAP_TOLERANCE = 5
-
-# Non-water rows tolerated at the very bottom of a column before water is found.
-# Handles bright glare strips that don't classify as water.
 BOTTOM_SKIP_MAX = 30
-
 NUM_ZONES = 5
 ROI_TOP_FRAC = 0.5
 
@@ -64,33 +55,45 @@ def _water_depth_per_column(mask, gap_tolerance=GAP_TOLERANCE,
     For each column, find the highest contiguous water region from the bottom.
 
     Tolerates up to `bottom_skip_max` non-water rows at the very bottom
-    (handles glare strips). Once water is found, tolerates up to
-    `gap_tolerance` consecutive non-water rows (handles reflection holes).
+    of a column before the first water pixel (handles glare strips).
+    Once water is found, tolerates up to `gap_tolerance` consecutive
+    non-water rows (handles reflection holes) before declaring an obstacle.
+
+    Vectorized across columns: iterates rows, applies per-row numpy ops
+    to all columns simultaneously. Matches the original loop's semantics
+    exactly.
     """
     h, w = mask.shape
-    is_water = (mask > 0)[::-1, :]  # flip so row 0 = bottom of frame
+    if h == 0:
+        return np.zeros(w, dtype=np.int32)
 
-    depths = np.zeros(w, dtype=np.int32)
-    for col in range(w):
-        column = is_water[:, col]
-        depth = 0
-        gap = 0
-        found_water = False
-        for row in range(h):
-            if column[row]:
-                depth = row + 1
-                gap = 0
-                found_water = True
-            else:
-                if not found_water:
-                    if row >= bottom_skip_max:
-                        break
-                    continue
-                gap += 1
-                if gap > gap_tolerance:
-                    break
-        depths[col] = depth
-    return depths
+    is_water = (mask > 0)[::-1, :]  # row 0 = bottom of frame
+
+    has_seen_water = np.zeros(w, dtype=bool)
+    gap = np.zeros(w, dtype=np.int32)
+    depth = np.zeros(w, dtype=np.int32)
+    stopped = np.zeros(w, dtype=bool)
+
+    for r in range(h):
+        is_w = is_water[r, :]
+        active = ~stopped
+
+        # Update gap counter: reset on water, increment on non-water
+        gap = np.where(is_w, 0, gap + 1)
+
+        # Record water depth where active and this row has water
+        water_here = is_w & active
+        depth = np.where(water_here, r + 1, depth)
+        has_seen_water |= water_here
+
+        # Bottom-skip stop: still no water seen and we've exceeded the budget
+        if r >= bottom_skip_max:
+            stopped |= active & (~is_w) & (~has_seen_water)
+
+        # Gap-tolerance stop: gap exceeds tolerance after water has been seen
+        stopped |= active & has_seen_water & (gap > gap_tolerance)
+
+    return depth
 
 
 def analyze(frame, thresholds=None, is_rgb=False):
