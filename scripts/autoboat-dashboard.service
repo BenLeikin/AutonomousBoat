@@ -1,0 +1,15 @@
+[Unit]
+Description=AutoBoat2w dashboard (IMU attitude + Pi telemetry web UI)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=ben
+WorkingDirectory=/home/ben/autoboat/scripts
+ExecStart=/home/ben/autoboat-env/bin/python /home/ben/autoboat/scripts/autoboat_dashboard.py
+Restart=on-failure
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target
