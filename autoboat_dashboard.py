@@ -124,7 +124,7 @@ except Exception as e:
 # ---------- Complementary filter config ----------
 ALPHA = 0.98          # near 1.0: gyro short-term, accel long-term (drift kill)
 ROLL_SIGN = 1         # set to -1 if the boat heels the wrong way
-PITCH_SIGN = 1        # set to -1 if bow/stern is reversed
+PITCH_SIGN = -1       # flipped: clone IMU reads bow/stern reversed
 YAW_SIGN = 1
 
 att = {"roll": 0.0, "pitch": 0.0, "yaw": 0.0, "hz": 0.0, "ok": False}   # radians + measured Hz
@@ -240,16 +240,16 @@ def camera_loop():
     fps = 0.0
     while True:
         try:
-            frame = picam.capture_array()         # RGB
+            frame = picam.capture_array()         # "RGB888" but actually BGR order
         except Exception:
             time.sleep(0.05)
             continue
 
         t0 = time.monotonic()
-        result = analyze(frame, is_rgb=True)
+        result = analyze(frame, is_rgb=False)
         latency = (time.monotonic() - t0) * 1000.0
 
-        vis = annotate(frame, result, is_rgb=True)  # returns BGR
+        vis = annotate(frame, result, is_rgb=False)  # frame is already BGR
         ok, buf = cv2.imencode(".jpg", vis, [int(cv2.IMWRITE_JPEG_QUALITY), 80])
         if ok:
             with flock:
@@ -282,12 +282,12 @@ def _free_mb(path):
 
 
 def _accumulate_hsv(frame_rgb):
-    # Sample the lower-center patch, most likely open water while the boat is
-    # being moved around, and accumulate pixel-level HSV sums for calibration.
+    # frame_rgb is actually BGR (picamera2 "RGB888" order). Sample the lower-center
+    # patch, most likely open water, and accumulate pixel-level HSV sums.
     try:
         h, w = frame_rgb.shape[:2]
         patch = frame_rgb[int(h * 0.70):h, int(w * 0.35):int(w * 0.65)]
-        hsv = cv2.cvtColor(patch, cv2.COLOR_RGB2HSV).reshape(-1, 3).astype("float64")
+        hsv = cv2.cvtColor(patch, cv2.COLOR_BGR2HSV).reshape(-1, 3).astype("float64")
         s = hsv.sum(axis=0)
         sq = (hsv * hsv).sum(axis=0)
         _cap_hsv["n"] += hsv.shape[0]
@@ -392,8 +392,8 @@ def _maybe_capture(frame_rgb, result):
             pack_v = power["pack_v"]; cur = power["current_ma"]
         fname = "frame_%06d.jpg" % n
         try:
-            cv2.imwrite(os.path.join(sdir, "frames", fname),
-                        cv2.cvtColor(frame_rgb, cv2.COLOR_RGB2BGR),
+            # frame_rgb is already BGR (picamera2 order), which is what imwrite wants.
+            cv2.imwrite(os.path.join(sdir, "frames", fname), frame_rgb,
                         [int(cv2.IMWRITE_JPEG_QUALITY), 90])
         except Exception as e:
             cap["error"] = "save failed: %s" % e
