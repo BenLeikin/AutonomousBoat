@@ -25,6 +25,11 @@ BOTTOM_SKIP_MAX = 30
 NUM_ZONES = 5
 ROI_TOP_FRAC = 0.5
 
+DEFAULT_METHOD = "texture"   # "texture" (smoothness-based) or "color" (legacy HSV)
+TEXTURE_WINDOW = 9           # local window (px) for texture-energy smoothing
+VERT_CLOSE = 15              # vertical close (px) to bridge in-column reflection/glare holes
+DEPTH_SMOOTH = 15            # cross-column median window to repair reflection-spiked columns
+
 
 @dataclass
 class NavResult:
@@ -47,6 +52,61 @@ def threshold_water(img_bgr, thresholds=None):
     mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel, iterations=2)
     mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel, iterations=1)
     return mask
+
+
+def texture_water_mask(img_bgr, window=TEXTURE_WINDOW):
+    """Binary water mask based on smoothness rather than colour.
+
+    Pool water is a low-texture surface; walls, deck, furniture and plants are
+    full of edges (window frames, door lines, slats, foliage). Colour can't tell
+    pale water from pale stucco or concrete, but texture can: water is smooth,
+    structure is busy. We measure local gradient energy and call the smooth
+    regions water, using Otsu so the smooth/busy split adapts to the lighting
+    instead of relying on a fixed magic number.
+    """
+    gray = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
+    gx = cv2.Sobel(gray, cv2.CV_32F, 1, 0, ksize=3)
+    gy = cv2.Sobel(gray, cv2.CV_32F, 0, 1, ksize=3)
+    energy = cv2.blur(cv2.magnitude(gx, gy), (window, window))
+    energy8 = cv2.normalize(energy, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
+    # Water = low energy, so threshold inverted: 255 where energy is below Otsu.
+    _, mask = cv2.threshold(energy8, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
+    kernel = np.ones((5, 5), np.uint8)
+    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel, iterations=1)
+    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel, iterations=2)
+    return mask
+
+
+def segment_water(img_bgr, method=None, thresholds=None):
+    """Binary water mask. method='texture' (default, smoothness) or 'color'
+    (legacy HSV box, kept for comparison)."""
+    if (method or DEFAULT_METHOD) == "color":
+        return threshold_water(img_bgr, thresholds)
+    return texture_water_mask(img_bgr)
+
+
+def _bridge_columns(mask, k=VERT_CLOSE):
+    """Vertical morphological close: fills holes shorter than k pixels within a
+    column so a reflection or glare band inside the water doesn't read as the
+    waterline. A real wall is far taller than k, so it isn't bridged."""
+    if k <= 1:
+        return mask
+    return cv2.morphologyEx(mask, cv2.MORPH_CLOSE, np.ones((k, 1), np.uint8))
+
+
+def _smooth_depths(depths, k=DEPTH_SMOOTH):
+    """Median-filter per-column depths across columns. The waterline is spatially
+    coherent, so columns spiked low by a leftover reflection get repaired by their
+    neighbours, while the left-to-right trend the zones depend on survives (the
+    window is far narrower than a zone)."""
+    if k <= 1 or depths.size < k:
+        return depths
+    if k % 2 == 0:
+        k += 1
+    pad = k // 2
+    padded = np.pad(depths, pad, mode="edge")
+    windows = np.lib.stride_tricks.sliding_window_view(padded, k)
+    return np.median(windows, axis=1).astype(depths.dtype)
 
 
 def _water_depth_per_column(mask, gap_tolerance=GAP_TOLERANCE,
@@ -96,8 +156,9 @@ def _water_depth_per_column(mask, gap_tolerance=GAP_TOLERANCE,
     return depth
 
 
-def analyze(frame, thresholds=None, is_rgb=False):
-    """Main entry point. Returns NavResult."""
+def analyze(frame, thresholds=None, is_rgb=False, method=None):
+    """Main entry point. Returns NavResult. `method` selects segmentation:
+    'texture' (default) or 'color' (legacy HSV)."""
     if is_rgb:
         img_bgr = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
     else:
@@ -107,8 +168,10 @@ def analyze(frame, thresholds=None, is_rgb=False):
     roi_top = int(full_h * ROI_TOP_FRAC)
     roi = img_bgr[roi_top:, :]
 
-    mask = threshold_water(roi, thresholds)
+    mask = segment_water(roi, method=method, thresholds=thresholds)
+    mask = _bridge_columns(mask)
     depths = _water_depth_per_column(mask)
+    depths = _smooth_depths(depths)
 
     zone_w = full_w // NUM_ZONES
     zones = []
