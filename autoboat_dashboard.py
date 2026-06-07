@@ -2,6 +2,7 @@ import time
 import math
 import json
 import glob
+import re
 import os
 import shutil
 import threading
@@ -72,6 +73,10 @@ GPS_BAUD = 9600                    # VK-162 default (u-blox 7, 8N1)
 ALLOWED_ACTIONS = {
     "reboot": ["sudo", "-n", "systemctl", "reboot"],
     "shutdown": ["sudo", "-n", "systemctl", "poweroff"],
+    # --no-block so systemctl queues the restart and returns before systemd kills
+    # this very process; otherwise we can get killed mid-stop and the unit never
+    # comes back. Needs a sudoers line allowing this exact command.
+    "restart": ["sudo", "-n", "systemctl", "--no-block", "restart", "autoboat-dashboard"],
     # Add more shell actions here. Control-loop actions (emergency stop, start/stop
     # recording) are not shell commands; wire those to the control loop / logger
     # once those subsystems exist, then add a matching CONTROLS button.
@@ -137,16 +142,21 @@ YAW_SIGN = 1
 att = {"roll": 0.0, "pitch": 0.0, "yaw": 0.0, "hz": 0.0, "ok": False,
        "ax": 0.0, "ay": 0.0, "az": 0.0, "gx": 0.0, "gy": 0.0, "gz": 0.0}  # rad + raw
 alock = threading.Lock()
+imu_cmd = {"zero_yaw": False}     # set by the Zero-heading control; read in imu_loop
 
 sysm = {}                                                   # system metrics, shared
 slock = threading.Lock()
 
 # ---------- Camera + vision shared state ----------
 proc = {"fps": 0.0, "latency_ms": 0.0, "best_zone": 0,
-        "center_pct": 0.0, "zones": [0, 0, 0, 0, 0], "cam_ok": False}
+        "center_pct": 0.0, "zones": [0, 0, 0, 0, 0], "cam_ok": False,
+        "cmd": {"mode": "run", "turn": 0.0, "throttle": 0.0, "left": 0.0,
+                "right": 0.0, "reason": "idle", "armed": False}}
 plock = threading.Lock()
 frame_buf = {"jpeg": None}
 flock = threading.Lock()
+raw_buf = {"frame": None}         # latest raw BGR frame, for on-demand snapshots
+rlock = threading.Lock()
 
 # ---------- GPS shared state ----------
 gps = {"connected": False, "fix_type": "none", "valid": False,
@@ -177,7 +187,8 @@ CAPTURE_MIN_FRAMES = 20           # need at least this many frames to trust cali
 
 cap = {"recording": False, "session": None, "started": 0.0,
        "frames": 0, "last_save": 0.0, "free_mb": None, "error": None,
-       "stop_reason": None}
+       "stop_reason": None,
+       "last_session": None, "last_frames": 0, "last_duration": 0.0}
 caplock = threading.Lock()
 _cap_fh = {"f": None}             # open telemetry file handle (guarded by caplock)
 _cap_meta = {"d": None}           # session manifest dict in progress (guarded by caplock)
@@ -218,6 +229,9 @@ def imu_loop():
             win = now
 
         with alock:
+            if imu_cmd["zero_yaw"]:
+                yaw = 0.0
+                imu_cmd["zero_yaw"] = False
             att["roll"] = ROLL_SIGN * roll
             att["pitch"] = PITCH_SIGN * pitch
             att["yaw"] = YAW_SIGN * yaw
@@ -229,6 +243,169 @@ def imu_loop():
         sleep_left = PERIOD - (time.monotonic() - start)
         if sleep_left > 0:
             time.sleep(sleep_left)
+
+
+# ---------- Controller (dry-run) ----------
+# Reactive obstacle avoidance, no goal heading. It reads the vision zones and
+# the center water depth, decides a turn and throttle, tank-mixes them into
+# left/right motor commands, and logs them. It does NOT drive anything: ARMED is
+# False, so the actuation point in camera_loop is a no-op. Arming later means
+# setting ARMED True and mapping cmd["left"]/cmd["right"] to the DRV8833 at the
+# marked spot in camera_loop. All tuning is the CTL_* one-liners below.
+ARMED = False
+
+CTL_EMA = 0.6              # smoothing on turn/throttle each frame (1=raw, 0=frozen)
+CTL_DEADBAND = 0.08        # |turn| below this snaps to straight (no twitch)
+CTL_BLOCKED_PCT = 12.0     # center water below this => blocked, enter search
+CTL_CLEAR_PCT = 22.0       # center water at/above this => open enough to run again
+CTL_COMFORT_PCT = 38.0     # this open AND the field flat => hold straight, stop
+CTL_COMFORT_SPREAD = 0.18  #   chasing marginally-deeper edges (the weaving fix)
+CTL_TURN_GAIN = 1.2        # maps the openness centroid [-1,1] to a turn command
+CTL_MAX_THROTTLE = 0.60    # forward cap (fraction of full)
+CTL_MIN_THROTTLE = 0.25    # crawl throttle when the path is only just open
+CTL_SEARCH_TURN = 0.50     # pivot magnitude while searching
+CTL_STUCK_SEC = 5.0        # search longer than this => unstick
+CTL_REVERSE = 0.50         # reverse throttle magnitude during unstick
+CTL_UNSTICK_SEC = 1.2      # how long the unstick reverse lasts
+CTL_YAW_MIN = 0.15         # rad/s; commanding a pivot but yawing less than this...
+CTL_YAW_STUCK_SEC = 2.0    #   ...for this long counts as stuck (ARMED only; needs real motion)
+
+ctl = {"mode": "run", "turn": 0.0, "throttle": 0.0, "left": 0.0, "right": 0.0,
+       "reason": "init", "pivot_dir": 1, "search_since": None,
+       "unstick_until": None, "yaw_low_since": None}
+ctllock = threading.Lock()
+
+
+def _analyze_zones(zones):
+    """Pure. Turn the 5 zone depths into a steering signal.
+
+    Returns the openness-weighted centroid of the zones mapped onto [-1, 1]
+    (left to right) and the field flatness. Weights are squared so the boat
+    commits to the single dominant opening instead of averaging two separate
+    gaps into the obstacle between them. Because the zone positions are
+    symmetric about 0, equal openness yields a centroid of 0 (straight): a
+    fully open or saturated field does not manufacture a turn the way picking
+    argmax(best_zone) does. `spread` is (max-min)/max, a 0..1 flatness measure
+    the comfort gate uses to decide the field is uniform enough to just hold.
+    """
+    z = [max(0.0, float(v)) for v in zones]
+    n = len(z)
+    if n == 0:
+        return {"centroid": 0.0, "zmax": 0.0, "spread": 0.0}
+    zmax = max(z)
+    if n == 1 or zmax <= 0.0:
+        return {"centroid": 0.0, "zmax": zmax, "spread": 0.0}
+    pos = [(-1.0 + 2.0 * i / (n - 1)) for i in range(n)]   # zone centers on [-1,1]
+    w = [v * v for v in z]
+    wsum = sum(w)
+    centroid = sum(p * wi for p, wi in zip(pos, w)) / wsum if wsum > 0 else 0.0
+    spread = (zmax - min(z)) / zmax
+    return {"centroid": centroid, "zmax": zmax, "spread": spread}
+
+
+def _clamp(x, lo=-1.0, hi=1.0):
+    return lo if x < lo else hi if x > hi else x
+
+
+def control_step(zones, center, yaw_rate, now):
+    """Stateful reactive controller. Mutates `ctl` under lock, returns the
+    command dict (mode/turn/throttle/left/right/reason/armed). Computes and logs
+    only; with ARMED False nothing is actuated. `center` is center_depth_pct,
+    `yaw_rate` is rad/s (only used for the ARMED stuck check)."""
+    a = _analyze_zones(zones)
+    centroid = a["centroid"]
+    spread = a["spread"]
+    blocked = center < CTL_BLOCKED_PCT
+    clear = center >= CTL_CLEAR_PCT
+
+    with ctllock:
+        mode = ctl["mode"]
+
+        # ---- transitions (hysteresis between blocked and clear) ----
+        if mode == "unstick":
+            if not (ctl["unstick_until"] is not None and now < ctl["unstick_until"]):
+                # reverse finished: flip the latched pivot and go back to searching
+                ctl["unstick_until"] = None
+                ctl["pivot_dir"] = -ctl["pivot_dir"]
+                ctl["search_since"] = now
+                ctl["yaw_low_since"] = None
+                mode = "search"
+        elif mode == "search":
+            if clear:
+                mode = "run"
+                ctl["search_since"] = None
+                ctl["yaw_low_since"] = None
+            else:
+                stuck = (ctl["search_since"] is not None
+                         and (now - ctl["search_since"]) > CTL_STUCK_SEC)
+                yaw_stuck = False
+                if ARMED:
+                    if abs(yaw_rate) < CTL_YAW_MIN:
+                        if ctl["yaw_low_since"] is None:
+                            ctl["yaw_low_since"] = now
+                        yaw_stuck = (now - ctl["yaw_low_since"]) > CTL_YAW_STUCK_SEC
+                    else:
+                        ctl["yaw_low_since"] = None
+                if stuck or yaw_stuck:
+                    mode = "unstick"
+                    ctl["unstick_until"] = now + CTL_UNSTICK_SEC
+                    ctl["yaw_low_since"] = None
+        else:  # run
+            if blocked:
+                mode = "search"
+                ctl["search_since"] = now
+                # latch the pivot toward the side that currently looks more open
+                ctl["pivot_dir"] = 1 if centroid >= 0 else -1
+
+        ctl["mode"] = mode
+
+        # ---- act on the (possibly updated) mode ----
+        cause = None
+        if mode == "unstick":
+            turn_raw, thr_raw = 0.0, -CTL_REVERSE
+            reason = "unstick: backing off both motors"
+        elif mode == "search":
+            d = ctl["pivot_dir"]
+            turn_raw, thr_raw = CTL_SEARCH_TURN * d, 0.0
+            reason = "search: blocked, pivoting " + ("right" if d > 0 else "left")
+        else:  # run
+            turn_raw = _clamp(CTL_TURN_GAIN * centroid)
+            if center >= CTL_COMFORT_PCT and spread < CTL_COMFORT_SPREAD:
+                turn_raw = 0.0
+                cause = "comfort"
+            elif abs(turn_raw) < CTL_DEADBAND:
+                turn_raw = 0.0
+                cause = "deadband"
+            else:
+                cause = "steer"
+            reason = ""   # filled in after smoothing, from the commanded turn
+            openness = _clamp(max(0.0, center) / 50.0, 0.0, 1.0)
+            thr_raw = CTL_MIN_THROTTLE + (CTL_MAX_THROTTLE - CTL_MIN_THROTTLE) * openness
+            thr_raw *= (1.0 - 0.4 * abs(turn_raw))   # ease off in a hard turn
+
+        # ---- EMA smoothing, then tank mix ----
+        turn = CTL_EMA * turn_raw + (1.0 - CTL_EMA) * ctl["turn"]
+        throttle = CTL_EMA * thr_raw + (1.0 - CTL_EMA) * ctl["throttle"]
+        left = _clamp(throttle - turn)
+        right = _clamp(throttle + turn)
+        # Run reason reflects the smoothed command, not the raw decision, so the
+        # readout never says "straight" while the EMA is still easing out a turn.
+        if mode == "run":
+            settled = abs(turn) < CTL_DEADBAND
+            if cause == "comfort":
+                reason = "run: open and flat, " + ("straight" if settled else "easing straight")
+            elif cause == "deadband":
+                reason = "run: centered" if settled else "run: easing to center"
+            else:
+                reason = "run: steering toward opening"
+        ctl["turn"] = turn
+        ctl["throttle"] = throttle
+        ctl["left"] = left
+        ctl["right"] = right
+        ctl["reason"] = reason
+        return {"mode": mode, "turn": round(turn, 3), "throttle": round(throttle, 3),
+                "left": round(left, 3), "right": round(right, 3),
+                "reason": reason, "armed": ARMED}
 
 
 def camera_loop():
@@ -261,7 +438,18 @@ def camera_loop():
         result = analyze(frame, is_rgb=False)
         latency = (time.monotonic() - t0) * 1000.0
 
+        with alock:
+            yaw_rate = YAW_SIGN * att["gz"]          # rad/s, for the stuck check
+        cmd = control_step(result.zones, result.center_depth_pct,
+                           yaw_rate, time.monotonic())
+        # ACTUATION POINT. Dry-run: nothing drives the motors. To arm, set ARMED
+        # True (above) and drive the DRV8833 from cmd["left"]/cmd["right"] here,
+        # e.g. set_motors(cmd["left"], cmd["right"]). left/right are signed
+        # fractions in [-1, 1]; map magnitude to PWM duty and sign to direction.
+
         vis = annotate(frame, result, is_rgb=False)  # frame is already BGR
+        with rlock:
+            raw_buf["frame"] = frame
         ok, buf = cv2.imencode(".jpg", vis, [int(cv2.IMWRITE_JPEG_QUALITY), 80])
         if ok:
             with flock:
@@ -281,8 +469,9 @@ def camera_loop():
             proc["center_pct"] = float(result.center_depth_pct)
             proc["zones"] = list(result.zones)
             proc["cam_ok"] = True
+            proc["cmd"] = cmd
 
-        _maybe_capture(frame, result, fps, latency)
+        _maybe_capture(frame, result, fps, latency, cmd)
 
 
 # ---------- Capture / data-collection helpers ----------
@@ -341,7 +530,8 @@ def _pipeline_meta():
     return {"available": True, "method": g("DEFAULT_METHOD"), "num_zones": g("NUM_ZONES"),
             "roi_top_frac": g("ROI_TOP_FRAC"), "gap_tolerance": g("GAP_TOLERANCE"),
             "bottom_skip_max": g("BOTTOM_SKIP_MAX"), "texture_window": g("TEXTURE_WINDOW"),
-            "vert_close": g("VERT_CLOSE"), "depth_smooth": g("DEPTH_SMOOTH")}
+            "vert_close": g("VERT_CLOSE"), "depth_smooth": g("DEPTH_SMOOTH"),
+            "connect_from_bottom": g("CONNECT_FROM_BOTTOM")}
 
 
 def _session_meta():
@@ -370,6 +560,13 @@ def _session_meta():
                     "jpeg_quality": 90, "data_root": DATA_ROOT},
         "sensors_online_at_start": {"camera": CAMERA_AVAILABLE, "imu": imu_on,
                                     "power": pwr_on, "gps": gps_on},
+        "controller": {"armed": ARMED, "ema": CTL_EMA, "deadband": CTL_DEADBAND,
+                       "blocked_pct": CTL_BLOCKED_PCT, "clear_pct": CTL_CLEAR_PCT,
+                       "comfort_pct": CTL_COMFORT_PCT, "comfort_spread": CTL_COMFORT_SPREAD,
+                       "turn_gain": CTL_TURN_GAIN, "max_throttle": CTL_MAX_THROTTLE,
+                       "min_throttle": CTL_MIN_THROTTLE, "search_turn": CTL_SEARCH_TURN,
+                       "stuck_sec": CTL_STUCK_SEC, "reverse": CTL_REVERSE,
+                       "unstick_sec": CTL_UNSTICK_SEC},
         "telemetry_columns": TELEMETRY_COLUMNS,
     }
 
@@ -512,6 +709,10 @@ def _finalize_session_locked(reason):
         _write_manifest(sdir, meta)
     _cap_event(sdir, "capture stopped (reason=%s, frames=%d)" % (reason, frames))
     _cap_meta["d"] = None
+    if sdir:
+        cap["last_session"] = os.path.basename(sdir)
+        cap["last_frames"] = frames
+        cap["last_duration"] = round(time.monotonic() - started, 1) if started else 0.0
     return frames, sdir, calib
 
 
@@ -525,7 +726,41 @@ def capture_stop(reason="user"):
             "calibration": calib}
 
 
-def _maybe_capture(frame_rgb, result, fps, vision_ms):
+# ---------- In-process control actions ----------
+# These run inside the dashboard rather than as shell commands. The /action/<name>
+# handler checks PY_ACTIONS before falling back to ALLOWED_ACTIONS shell commands.
+def _do_imu_zero():
+    if not IMU_AVAILABLE:
+        return {"ok": False, "error": "IMU offline"}
+    with alock:
+        imu_cmd["zero_yaw"] = True
+    return {"ok": True, "message": "heading zeroed"}
+
+
+def _do_snapshot():
+    with rlock:
+        frame = raw_buf["frame"]
+    if frame is None:
+        return {"ok": False, "error": "no camera frame yet"}
+    cap_dir = os.path.join(DATA_ROOT, "captures")
+    try:
+        os.makedirs(cap_dir, exist_ok=True)
+        fname = time.strftime("snap_%Y%m%d_%H%M%S.jpg")
+        # frame is BGR (picamera2 order), which is what imwrite expects.
+        cv2.imwrite(os.path.join(cap_dir, fname), frame,
+                    [int(cv2.IMWRITE_JPEG_QUALITY), 95])
+    except Exception as e:
+        return {"ok": False, "error": "save failed: %s" % e}
+    return {"ok": True, "message": "saved " + fname}
+
+
+PY_ACTIONS = {
+    "imu_zero": _do_imu_zero,
+    "snapshot": _do_snapshot,
+}
+
+
+def _maybe_capture(frame_rgb, result, fps, vision_ms, cmd=None):
     # Called from camera_loop each frame; saves a still + a full telemetry row at
     # the configured interval while recording. Does its own locking.
     now = time.monotonic()
@@ -576,7 +811,9 @@ def _maybe_capture(frame_rgb, result, fps, vision_ms):
                 _fmt(cpu_pct, 1), _fmt(cpu_temp, 1), _fmt(uv), _fmt(thr), _fmt(uvo),
                 _fmt(g_fix), _fmt(g_valid), _fmt(g_lat, 6), _fmt(g_lon, 6), _fmt(g_alt, 1),
                 _fmt(g_sats), _fmt(g_hdop, 1), _fmt(g_sog, 2), _fmt(g_cog, 1),
-                "", "",  # cmd_left, cmd_right: reserved for the autonomy controller
+                (_fmt(int(round(cmd["left"] * 100))) if cmd else ""),
+                (_fmt(int(round(cmd["right"] * 100))) if cmd else ""),
+                # cmd_left, cmd_right: signed percent from the dry-run controller
             ]
             try:
                 fh.write(",".join(row) + "\n")
@@ -868,12 +1105,101 @@ def sys_loop():
             sysm.update(m)
 
 
+# ---------- Past-run analysis helpers ----------
+# Read-only access to recorded sessions for the Analyze tab. Session names are
+# strictly validated to keep the frame/file routes from escaping CAPTURE_ROOT.
+_SESSION_RE = re.compile(r"^session_[0-9_]+$")
+
+
+def _safe_session_dir(name):
+    if not name or not _SESSION_RE.match(name):
+        return None
+    d = os.path.join(CAPTURE_ROOT, name)
+    return d if os.path.isdir(d) else None
+
+
+def _read_json_file(path):
+    try:
+        with open(path) as f:
+            return json.load(f)
+    except Exception:
+        return None
+
+
+def _read_text_file(path, limit=200000):
+    try:
+        with open(path) as f:
+            return f.read(limit)
+    except Exception:
+        return None
+
+
+def _read_telemetry(sdir):
+    # Returns (columns, rows). rows is a list of lists of raw string cells.
+    try:
+        with open(os.path.join(sdir, "telemetry.csv")) as f:
+            lines = f.read().splitlines()
+    except Exception:
+        return None, None
+    if not lines:
+        return [], []
+    return lines[0].split(","), [ln.split(",") for ln in lines[1:] if ln]
+
+
+def _list_sessions():
+    try:
+        names = [n for n in os.listdir(CAPTURE_ROOT) if _SESSION_RE.match(n)]
+    except Exception:
+        names = []
+    out = []
+    for name in sorted(names, reverse=True):
+        sdir = os.path.join(CAPTURE_ROOT, name)
+        man = _read_json_file(os.path.join(sdir, "manifest.json")) or {}
+        frames = man.get("frames_saved")
+        if frames is None:
+            try:
+                frames = sum(1 for f in os.listdir(os.path.join(sdir, "frames"))
+                             if f.endswith(".jpg"))
+            except Exception:
+                frames = 0
+        out.append({
+            "name": name, "frames": frames,
+            "duration": man.get("duration_s"), "started": man.get("started_iso"),
+            "method": (man.get("pipeline") or {}).get("method"),
+            "lens": (man.get("camera") or {}).get("lens"),
+            "stop_reason": man.get("stop_reason"),
+        })
+    return out
+
+
+def _gps_points(cols, rows):
+    if not cols or "gps_lat" not in cols or "gps_lon" not in cols:
+        return []
+    la, lo = cols.index("gps_lat"), cols.index("gps_lon")
+    fx = cols.index("gps_fix") if "gps_fix" in cols else None
+    sg = cols.index("gps_sog_ms") if "gps_sog_ms" in cols else None
+    pts = []
+    for i, r in enumerate(rows):
+        if len(r) <= max(la, lo) or not r[la] or not r[lo]:
+            continue
+        try:
+            lat, lon = float(r[la]), float(r[lo])
+        except ValueError:
+            continue
+        pts.append({"i": i, "lat": lat, "lon": lon,
+                    "fix": r[fx] if fx is not None and len(r) > fx else None,
+                    "sog": r[sg] if sg is not None and len(r) > sg else None})
+    return pts
+
+
 PAGE = b"""<!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>AutoBoat2w</title>
+<title>AutoBoat</title>
+<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"/>
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
 <style>
   body { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; margin: 0; padding: 18px;
          background: #06090c; color: #c7d2da; }
@@ -911,10 +1237,36 @@ PAGE = b"""<!DOCTYPE html>
   .btn.armed { background: #7a1f1f; border-color: #d9534f; color: #fff; }
   .ctrl-status { margin-top: 12px; font-size: 12px; color: #7d96a3; letter-spacing: 0.5px;
                  min-height: 14px; }
+  .tabbar { display: flex; align-items: center; gap: 2px; border-bottom: 1px solid #1b2530;
+            margin-bottom: 18px; }
+  .tabbar .brand { font-size: 14px; font-weight: 500; letter-spacing: 1px; text-transform: uppercase;
+                   color: #7d96a3; margin-right: 18px; }
+  .tab { font-family: inherit; font-size: 12px; letter-spacing: 1px; text-transform: uppercase;
+         color: #6b8794; background: transparent; border: 0; border-bottom: 2px solid transparent;
+         padding: 10px 14px; cursor: pointer; }
+  .tab:hover { color: #c7d2da; }
+  .tab.active { color: #3fd0a8; border-bottom-color: #3fd0a8; }
+  select { font-family: inherit; font-size: 13px; color: #c7d2da; background: #11181f;
+           border: 1px solid #2a3742; border-radius: 8px; padding: 9px 12px; }
+  .achart { width: 100%; height: 120px; display: block; }
+  .amap { width: 100%; height: 340px; border: 1px solid #1b2530; border-radius: 8px;
+          background: #0c1014; }
+  .aframe { width: 100%; border-radius: 6px; background: #06090c; display: block; }
+  .muted { color: #6b8794; font-size: 12px; letter-spacing: 0.3px; }
+  .kv { display: grid; grid-template-columns: max-content 1fr; gap: 5px 14px; font-size: 12px; }
+  .kv div:nth-child(odd) { color: #6b8794; }
+  pre.events { white-space: pre-wrap; font-size: 12px; color: #9fb2bd; background: #0c1014;
+               border: 1px solid #1b2530; border-radius: 8px; padding: 10px 12px;
+               max-height: 220px; overflow: auto; }
 </style>
 </head>
 <body>
-<h1>AutoBoat</h1>
+<div class="tabbar">
+  <span class="brand">AutoBoat</span>
+  <button class="tab active" data-tab="live" onclick="showTab('live')">Live</button>
+  <button class="tab" data-tab="analyze" onclick="showTab('analyze')">Analyze runs</button>
+</div>
+<div id="tab-live">
 <div class="metrics">
   <div class="card"><div class="k">IMU RATE</div><div class="v" id="m_hz">--</div></div>
   <div class="card"><div class="k">CPU TEMP</div><div class="v" id="m_temp">--</div></div>
@@ -960,6 +1312,18 @@ PAGE = b"""<!DOCTYPE html>
   </div>
 </div>
 
+<h2>Decision <small style="color:#7d96a3">(dry-run, motors disarmed)</small></h2>
+<div class="panel">
+  <div class="metrics" style="grid-template-columns: repeat(auto-fit, minmax(100px, 1fr));">
+    <div class="card"><div class="k">MODE</div><div class="v" id="c_mode">--</div></div>
+    <div class="card"><div class="k">THROTTLE</div><div class="v" id="c_thr">--</div></div>
+    <div class="card"><div class="k">TURN</div><div class="v" id="c_turn">--</div></div>
+    <div class="card"><div class="k">LEFT</div><div class="v" id="c_left">--</div></div>
+    <div class="card"><div class="k">RIGHT</div><div class="v" id="c_right">--</div></div>
+  </div>
+  <div class="ctrl-status" id="c_reason">disarmed</div>
+</div>
+
 <h2>GPS</h2>
 <div class="panel">
   <div class="metrics" style="grid-template-columns: repeat(auto-fit, minmax(108px, 1fr));">
@@ -986,12 +1350,257 @@ PAGE = b"""<!DOCTYPE html>
   <div class="btn-row" id="ctrl_buttons"></div>
   <div class="ctrl-status" id="ctrl_status"></div>
 </div>
+</div><!-- /tab-live -->
+
+<div id="tab-analyze" style="display:none">
+  <h2>Analyze past runs</h2>
+  <div class="panel">
+    <div class="label">SESSION</div>
+    <div class="btn-row" style="align-items:center">
+      <select id="an_sel"><option value="">loading...</option></select>
+      <button class="btn" id="an_refresh">Refresh</button>
+      <span class="muted" id="an_meta"></span>
+    </div>
+  </div>
+
+  <div id="an_body" style="display:none">
+    <h2>Summary</h2>
+    <div class="metrics" id="an_summary"></div>
+
+    <h2>Frame</h2>
+    <div class="row">
+      <div class="panel">
+        <img class="aframe" id="an_img" alt="frame">
+        <input type="range" id="an_slider" min="0" max="0" value="0" style="margin-top:10px; width:100%">
+        <div class="ctrl-status" id="an_frameinfo"></div>
+        <div class="btn-row" style="margin-top:10px; align-items:center">
+          <span class="muted">view</span>
+          <select id="an_view"><option value="raw">raw</option><option value="proc">processed</option></select>
+          <span class="muted">method</span>
+          <select id="an_method"><option value="texture">texture</option><option value="color">color</option></select>
+          <button class="btn" id="an_reanalyze">Re-analyze run</button>
+        </div>
+        <div class="ctrl-status" id="an_compare"></div>
+      </div>
+      <div class="panel" style="max-width:320px">
+        <div class="label">TELEMETRY AT FRAME</div>
+        <div class="kv" id="an_kv"></div>
+      </div>
+    </div>
+
+    <h2>Telemetry</h2>
+    <div class="panel">
+      <div class="label">CENTER WATER % &mdash; open water ahead</div>
+      <canvas class="achart" id="an_c_center"></canvas>
+      <div class="label" style="margin-top:14px">PACK VOLTAGE (V)</div>
+      <canvas class="achart" id="an_c_power"></canvas>
+      <div class="label" style="margin-top:14px">ROLL / PITCH (deg)</div>
+      <canvas class="achart" id="an_c_att"></canvas>
+    </div>
+
+    <h2>GPS track</h2>
+    <div class="panel">
+      <div class="muted" id="an_gps_note" style="margin-bottom:10px"></div>
+      <div id="an_map" class="amap"></div>
+    </div>
+
+    <h2>Events</h2>
+    <pre class="events" id="an_events">--</pre>
+  </div>
+</div><!-- /tab-analyze -->
 <script>
+// ---- Tabs + past-run analysis ----
+let _anLoaded=false, _anData=null, _anMap=null, _anTrack=[], _anIdx=0;
+function showTab(name){
+  document.getElementById('tab-live').style.display = (name==='live')?'':'none';
+  document.getElementById('tab-analyze').style.display = (name==='analyze')?'':'none';
+  document.querySelectorAll('.tab').forEach(function(t){
+    t.classList.toggle('active', t.getAttribute('data-tab')===name);
+  });
+  if(name==='analyze'){
+    if(!_anLoaded){ _anLoaded=true; anLoadSessions(); }
+    if(_anMap){ setTimeout(function(){ _anMap.invalidateSize(); }, 60); }
+  }
+}
+function _col(n){ return _anData? _anData.cols.indexOf(n) : -1; }
+async function anLoadSessions(){
+  const sel=document.getElementById('an_sel');
+  try{
+    const list=await (await fetch('/sessions',{cache:'no-store'})).json();
+    if(!list.length){ sel.innerHTML='<option value="">no sessions found</option>'; return; }
+    sel.innerHTML=list.map(function(s){
+      const dur=(s.duration!=null)? Math.round(s.duration)+'s':'?';
+      return '<option value="'+s.name+'">'+s.name+'  ('+(s.frames||0)+'f, '+dur+')</option>';
+    }).join('');
+    anSelect(sel.value);
+  }catch(e){ sel.innerHTML='<option value="">failed to load</option>'; }
+}
+async function anSelect(name){
+  if(!name) return;
+  document.getElementById('an_meta').textContent='loading...';
+  try{
+    const man=await fetch('/session/'+name+'/manifest',{cache:'no-store'}).then(r=>r.json()).catch(()=>({}));
+    const tel=await fetch('/session/'+name+'/telemetry',{cache:'no-store'}).then(r=>r.json()).catch(()=>({columns:[],rows:[]}));
+    const ev=await fetch('/session/'+name+'/events',{cache:'no-store'}).then(r=>r.text()).catch(()=>'');
+    _anData={ name:name, man:man||{}, cols:tel.columns||[], rows:tel.rows||[], series:null, reCenter:null };
+    const mm=(man&&man.pipeline&&man.pipeline.method)||'texture';
+    const msel=document.getElementById('an_method'); if(mm==='texture'||mm==='color') msel.value=mm;
+    document.getElementById('an_view').value='raw';
+    document.getElementById('an_compare').textContent='';
+    document.getElementById('an_body').style.display='';
+    anBuildSeries(); anRenderSummary(); anSetupFrames(); anRenderEvents(ev); anRenderMap();
+    document.getElementById('an_meta').textContent='';
+  }catch(e){ document.getElementById('an_meta').textContent='failed: '+e.message; }
+}
+function anBuildSeries(){
+  const rows=_anData.rows;
+  function ser(n){ const i=_anData.cols.indexOf(n); const out=[]; if(i<0) return out;
+    for(let k=0;k<rows.length;k++){ const v=parseFloat(rows[k][i]); if(!isNaN(v)) out.push({x:k,y:v}); } return out; }
+  _anData.series={ center:ser('center_pct'), pack:ser('pack_v'), roll:ser('roll_deg'), pitch:ser('pitch_deg') };
+}
+function anRenderSummary(){
+  const m=_anData.man||{}, rows=_anData.rows;
+  function stat(n,f){ const i=_anData.cols.indexOf(n); if(i<0) return null;
+    const xs=[]; for(const r of rows){ const v=parseFloat(r[i]); if(!isNaN(v)) xs.push(v); }
+    return xs.length? f(xs):null; }
+  const avgC=stat('center_pct',xs=>xs.reduce((a,b)=>a+b,0)/xs.length);
+  const minP=stat('pack_v',xs=>Math.min.apply(null,xs));
+  const maxI=stat('current_ma',xs=>Math.max.apply(null,xs));
+  const maxT=stat('cpu_temp_c',xs=>Math.max.apply(null,xs));
+  const uvI=_anData.cols.indexOf('under_voltage'); let uv=0;
+  if(uvI>=0) for(const r of rows){ if(r[uvI]==='1') uv++; }
+  const cards=[
+    ['FRAMES', rows.length],
+    ['DURATION', m.duration_s!=null? Math.round(m.duration_s)+' s':'?'],
+    ['METHOD', (m.pipeline||{}).method||'?'],
+    ['LENS', (m.camera||{}).lens||'?'],
+    ['AVG CENTER', avgC!=null? avgC.toFixed(0)+' %':'--'],
+    ['MIN PACK', minP!=null? minP.toFixed(2)+' V':'--'],
+    ['MAX CURRENT', maxI!=null? Math.round(maxI)+' mA':'--'],
+    ['MAX CPU', maxT!=null? maxT.toFixed(0)+' &deg;C':'--'],
+    ['UNDERVOLT ROWS', uv],
+    ['STOP', m.stop_reason||'?']
+  ];
+  document.getElementById('an_summary').innerHTML=cards.map(function(c){
+    return '<div class="card"><div class="k">'+c[0]+'</div><div class="v">'+c[1]+'</div></div>';
+  }).join('');
+}
+function drawChart(canvas, series, opts){
+  opts=opts||{};
+  const dpr=window.devicePixelRatio||1, w=canvas.clientWidth, h=canvas.clientHeight;
+  canvas.width=w*dpr; canvas.height=h*dpr;
+  const ctx=canvas.getContext('2d'); ctx.scale(dpr,dpr); ctx.clearRect(0,0,w,h);
+  let xmin=Infinity,xmax=-Infinity,ymin=(opts.ymin!=null?opts.ymin:Infinity),ymax=(opts.ymax!=null?opts.ymax:-Infinity);
+  series.forEach(s=>s.data.forEach(p=>{ if(p.x<xmin)xmin=p.x; if(p.x>xmax)xmax=p.x; }));
+  if(opts.ymin==null||opts.ymax==null) series.forEach(s=>s.data.forEach(p=>{ if(p.y<ymin)ymin=p.y; if(p.y>ymax)ymax=p.y; }));
+  ctx.font='10px monospace';
+  if(!isFinite(xmin)){ ctx.fillStyle='#6b8794'; ctx.fillText('no data',8,18); return; }
+  if(ymin===ymax){ ymax=ymin+1; }
+  const padL=30, padB=16;
+  function X(x){ return padL + (x-xmin)/((xmax-xmin)||1)*(w-padL-6); }
+  function Y(y){ return (h-padB) - (y-ymin)/((ymax-ymin)||1)*(h-padB-6); }
+  ctx.strokeStyle='#1b2530'; ctx.lineWidth=1;
+  ctx.beginPath(); ctx.moveTo(padL,4); ctx.lineTo(padL,h-padB); ctx.lineTo(w-6,h-padB); ctx.stroke();
+  ctx.fillStyle='#6b8794'; ctx.fillText(ymax.toFixed(1),2,11); ctx.fillText(ymin.toFixed(1),2,h-padB);
+  series.forEach(function(s){ ctx.strokeStyle=s.color; ctx.lineWidth=1.4; ctx.beginPath();
+    let started=false; s.data.forEach(function(p){ const px=X(p.x),py=Y(p.y);
+      if(!started){ ctx.moveTo(px,py); started=true; } else ctx.lineTo(px,py); }); ctx.stroke(); });
+  if(opts.cursorX!=null){ const cx=X(opts.cursorX); ctx.strokeStyle='#d9b13a'; ctx.lineWidth=1;
+    ctx.beginPath(); ctx.moveTo(cx,4); ctx.lineTo(cx,h-padB); ctx.stroke(); }
+}
+function anRenderCharts(cursor){
+  if(!_anData.series) anBuildSeries();
+  const s=_anData.series;
+  const centerSeries=[{data:s.center,color:'#3fd0a8'}];
+  if(_anData.reCenter){
+    const re=[]; for(let k=0;k<_anData.reCenter.length;k++){ const v=_anData.reCenter[k]; if(v!=null) re.push({x:k,y:v}); }
+    centerSeries.push({data:re,color:'#d9b13a'});
+  }
+  drawChart(document.getElementById('an_c_center'),centerSeries,{ymin:0,ymax:100,cursorX:cursor});
+  drawChart(document.getElementById('an_c_power'),[{data:s.pack,color:'#d9b13a'}],{cursorX:cursor});
+  drawChart(document.getElementById('an_c_att'),[{data:s.roll,color:'#3fd0a8'},{data:s.pitch,color:'#5aa9e6'}],{cursorX:cursor});
+}
+function anSetupFrames(){
+  const slider=document.getElementById('an_slider'), n=_anData.rows.length;
+  slider.max=Math.max(0,n-1); slider.value=0;
+  slider.oninput=function(){ anShowFrame(parseInt(slider.value,10)); };
+  if(n>0) anShowFrame(0); else { document.getElementById('an_frameinfo').textContent='no frames'; }
+}
+function anShowFrame(idx){
+  const rows=_anData.rows; if(idx<0||idx>=rows.length) return;
+  _anIdx=idx;
+  const r=rows[idx];
+  const view=document.getElementById('an_view').value;
+  const method=document.getElementById('an_method').value;
+  const img=document.getElementById('an_img');
+  if(view==='proc'){ img.src='/session/'+_anData.name+'/analyze/'+idx+'?method='+method; }
+  else { img.src='/session/'+_anData.name+'/frame/'+idx; }
+  document.getElementById('an_frameinfo').textContent='frame '+idx+' / '+(rows.length-1)+
+    (view==='proc'? '  (processed: '+method+')':'');
+  const fields=[['center_pct','center %'],['best_zone','best zone'],
+    ['z0','z0'],['z1','z1'],['z2','z2'],['z3','z3'],['z4','z4'],
+    ['roll_deg','roll'],['pitch_deg','pitch'],['yaw_deg','yaw'],
+    ['pack_v','pack V'],['current_ma','current mA'],['cpu_temp_c','cpu C'],['under_voltage','undervolt']];
+  document.getElementById('an_kv').innerHTML=fields.map(function(f){
+    const i=_anData.cols.indexOf(f[0]); const v=(i>=0&&i<r.length&&r[i]!=='')? r[i]:'--';
+    return '<div>'+f[1]+'</div><div>'+v+'</div>'; }).join('');
+  anRenderCharts(idx);
+}
+function anRenderEvents(txt){
+  document.getElementById('an_events').textContent=(txt&&txt.trim())? txt:'no events logged';
+}
+async function anRenderMap(){
+  const note=document.getElementById('an_gps_note'), mapdiv=document.getElementById('an_map');
+  let pts=[];
+  try{ pts=(await (await fetch('/session/'+_anData.name+'/gps',{cache:'no-store'})).json()).points||[]; }catch(e){}
+  if(!pts.length){ note.textContent='No GPS fixes in this run.'; mapdiv.style.display='none'; return; }
+  mapdiv.style.display='';
+  note.textContent=pts.length+' fixes. At pool scale GPS error (~2.5 m) exceeds the pool, so this track is mostly noise; it is meaningful only on open water.';
+  if(typeof L==='undefined'){ note.textContent+=' (map needs internet to load tiles)'; return; }
+  if(!_anMap){ _anMap=L.map('an_map',{maxZoom:22});
+    L.tileLayer('https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}',
+      {maxZoom:22, maxNativeZoom:19, attribution:'Esri World Imagery'}).addTo(_anMap); }
+  _anTrack.forEach(function(l){ _anMap.removeLayer(l); }); _anTrack=[];
+  const ll=pts.map(function(p){ return [p.lat,p.lon]; });
+  const line=L.polyline(ll,{color:'#3fd0a8',weight:3}); line.addTo(_anMap); _anTrack.push(line);
+  const a=L.circleMarker(ll[0],{radius:6,color:'#3fd0a8'}); a.addTo(_anMap); _anTrack.push(a);
+  const b=L.circleMarker(ll[ll.length-1],{radius:6,color:'#d9534f'}); b.addTo(_anMap); _anTrack.push(b);
+  _anMap.fitBounds(line.getBounds(),{padding:[20,20], maxZoom:21});
+  setTimeout(function(){ _anMap.invalidateSize(); },60);
+}
+document.getElementById('an_sel').onchange=function(){ anSelect(this.value); };
+document.getElementById('an_refresh').onclick=anLoadSessions;
+document.getElementById('an_view').onchange=function(){ if(_anData) anShowFrame(_anIdx); };
+document.getElementById('an_method').onchange=function(){
+  if(_anData && document.getElementById('an_view').value==='proc') anShowFrame(_anIdx);
+};
+document.getElementById('an_reanalyze').onclick=async function(){
+  if(!_anData) return;
+  const method=document.getElementById('an_method').value;
+  const note=document.getElementById('an_compare');
+  note.style.color='#7d96a3'; note.textContent='re-analyzing run with '+method+' on the Pi, this can take a bit...';
+  try{
+    const d=await (await fetch('/session/'+_anData.name+'/reanalyze?method='+method,{cache:'no-store'})).json();
+    if(d.error){ note.style.color='#d9534f'; note.textContent='re-analyze failed: '+d.error; return; }
+    _anData.reCenter=d.center||null;
+    let rec=null; const i=_anData.cols.indexOf('center_pct');
+    if(i>=0){ const xs=[]; for(const r of _anData.rows){ const v=parseFloat(r[i]); if(!isNaN(v)) xs.push(v); }
+      if(xs.length) rec=xs.reduce((a,b)=>a+b,0)/xs.length; }
+    note.style.color='#3fd0a8';
+    note.textContent=method+' avg center '+(d.avg_center!=null? d.avg_center+'%':'--')+
+      (rec!=null? ('  vs recorded '+rec.toFixed(1)+'%'):'')+'  ('+d.frames+' frames). Amber line on the chart is the re-analysis.';
+    anRenderCharts(_anIdx);
+  }catch(e){ note.style.color='#d9534f'; note.textContent='re-analyze failed: '+e.message; }
+};
+
 // ---- Controls: add a button by adding one entry here. Danger buttons require
 // a second click to confirm. Shell actions need a matching ALLOWED_ACTIONS entry
 // on the server; subsystem actions (estop, record) wire up once those exist. ----
 const CONTROLS = [
-  { id:'reboot', label:'Reboot Pi', action:'reboot', danger:true, confirm:'Click again to reboot' },
+  { id:'zeroyaw',  label:'Zero heading', action:'imu_zero' },
+  { id:'snap',     label:'Snapshot',     action:'snapshot' },
+  { id:'restart',  label:'Restart vision', action:'restart', danger:true, reconnect:true, confirm:'Click again to restart' },
+  { id:'reboot', label:'Reboot Pi', action:'reboot', danger:true, reconnect:true, confirm:'Click again to reboot' },
   { id:'shutdown', label:'Shut down', action:'shutdown', danger:true, confirm:'Click again to shut down' },
   // { id:'estop',    label:'Emergency stop', action:'estop', danger:true },  // needs control loop
 ];
@@ -1035,26 +1644,38 @@ async function runControl(c, btn){
   const st = document.getElementById('ctrl_status');
   st.style.color = '#7d96a3';
   st.textContent = c.label + ': sending...';
+  const drops = c.action==='reboot' || c.action==='shutdown' || c.action==='restart';
   try {
     const r = await fetch('/action/' + c.action, { method: 'POST' });
     let d = {};
     try { d = await r.json(); } catch(e){}
     if (r.ok && d.ok !== false){
       st.style.color = '#3fd0a8';
-      st.textContent = (d.message || (c.label + ' sent')) +
-        ((c.action === 'reboot' || c.action === 'shutdown') ? '. This page will go offline.' : '.');
+      st.textContent = d.message || (c.label + ' sent');
+      afterControl(c, st);
     } else {
       st.style.color = '#d9534f';
       st.textContent = c.label + ' failed: ' + (d.error || ('HTTP ' + r.status));
     }
   } catch(e){
-    if (c.action === 'reboot' || c.action === 'shutdown'){
+    if (drops){
       st.style.color = '#d9b13a';
-      st.textContent = c.label + ' sent. Connection closed, the Pi is going down.';
+      st.textContent = c.label + ' sent.';
+      afterControl(c, st);
     } else {
       st.style.color = '#d9534f';
       st.textContent = c.label + ' failed: ' + e.message;
     }
+  }
+}
+function afterControl(c, st){
+  if (c.action === 'restart'){
+    st.textContent += ' Reconnecting in a few seconds...';
+    setTimeout(function(){ location.reload(); }, 6000);
+  } else if (c.action === 'reboot'){
+    st.textContent += ' Page will return after the Pi reboots (~30s).';
+  } else if (c.action === 'shutdown'){
+    st.textContent += ' This page will go offline.';
   }
 }
 
@@ -1205,6 +1826,9 @@ async function procTick(){
   if(!d.cam_ok){
     set('p_fps','--','#7d96a3'); set('p_lat','--','#7d96a3');
     set('p_zone','--','#7d96a3'); set('p_center','--','#7d96a3');
+    set('c_mode','--','#7d96a3'); set('c_thr','--','#7d96a3');
+    set('c_turn','--','#7d96a3'); set('c_left','--','#7d96a3'); set('c_right','--','#7d96a3');
+    document.getElementById('c_reason').textContent='camera offline';
     return;
   }
   set('p_fps', d.fps.toFixed(1)+'<small> fps</small>',
@@ -1214,6 +1838,16 @@ async function procTick(){
   set('p_zone', 'Z'+d.best_zone+'<small> / 4</small>','#e6eef2');
   set('p_center', Math.round(d.center_pct)+'<small> %</small>',
       d.center_pct>=35?'#3fd0a8':d.center_pct>=25?'#d9b13a':'#d9534f');
+  const c = d.cmd;
+  if(c){
+    const mc = c.mode==='run'?'#3fd0a8':(c.mode==='search'?'#d9b13a':'#d9534f');
+    set('c_mode', c.mode, mc);
+    set('c_thr', (c.throttle>=0?'+':'')+Math.round(c.throttle*100)+'<small> %</small>', '#e6eef2');
+    set('c_turn', (c.turn>=0?'R ':'L ')+Math.abs(Math.round(c.turn*100))+'<small> %</small>', '#e6eef2');
+    set('c_left', (c.left>=0?'+':'')+Math.round(c.left*100)+'<small> %</small>', '#e6eef2');
+    set('c_right', (c.right>=0?'+':'')+Math.round(c.right*100)+'<small> %</small>', '#e6eef2');
+    document.getElementById('c_reason').textContent = (c.armed?'ARMED - ':'dry-run - ')+c.reason;
+  }
 }
 async function gpsTick(){
   let d;
@@ -1273,15 +1907,15 @@ async function sysTick(){
            d.wifi_dbm<=-78?'#d9534f':d.wifi_dbm<=-67?'#d9b13a':'#e6eef2');
   set('m_ip', d.ip? '<small>'+d.ip+'</small>' : '--', '#e6eef2');
   const pw=document.getElementById('m_power');
-  if(d.under_voltage){ pw.textContent='POWER: UNDERVOLTAGE NOW';
+  if(d.under_voltage){ pw.textContent='POWER: undervoltage now - the Pi 5V rail is sagging under load. Expect resets and SD corruption; check the supply.';
     pw.style.color='#fff'; pw.style.background='#7a1f1f'; pw.style.borderColor='#d9534f'; }
-  else if(d.throttled_now){ pw.textContent='POWER: THROTTLED NOW';
+  else if(d.throttled_now){ pw.textContent='POWER: throttled now - CPU has clocked down to cope with low voltage.';
     pw.style.color='#f0c067'; pw.style.background='#0c1014'; pw.style.borderColor='#d9b13a'; }
-  else if(d.uv_occurred){ pw.textContent='POWER: undervoltage occurred earlier this session';
+  else if(d.uv_occurred){ pw.textContent='POWER: undervoltage occurred earlier this session - the rail dipped at least once since boot. Stable now.';
     pw.style.color='#d9b13a'; pw.style.background='#0c1014'; pw.style.borderColor='#3a3320'; }
-  else if(d.under_voltage===false){ pw.textContent='POWER: OK';
+  else if(d.under_voltage===false){ pw.textContent='POWER: OK - 5V rail stable, no throttling.';
     pw.style.color='#3fd0a8'; pw.style.background='#0c1014'; pw.style.borderColor='#1b2530'; }
-  else { pw.textContent='POWER: vcgencmd unavailable'; pw.style.color='#7d96a3'; }
+  else { pw.textContent='POWER: vcgencmd unavailable (cannot read rail state).'; pw.style.color='#7d96a3'; }
 }
 async function powerTick(){
   let d;
@@ -1321,7 +1955,12 @@ async function capPoll(){
         d.elapsed + 's | free ' + (d.free_mb != null ? Math.round(d.free_mb) + ' MB' : '--');
     } else {
       st.style.color = '#7d96a3';
-      st.textContent = 'idle' + (d.session ? (' | last: ' + d.session) : '');
+      if (d.last_session){
+        st.textContent = 'idle | last: ' + d.last_session + ' | ' +
+          d.last_frames + ' frames | ' + d.last_duration + 's';
+      } else {
+        st.textContent = 'idle | no captures yet';
+      }
     }
   }catch(e){}
 }
@@ -1381,6 +2020,12 @@ class Handler(BaseHTTPRequestHandler):
             return
         if self.path.startswith("/action/"):
             name = self.path[len("/action/"):].strip("/")
+            if name in PY_ACTIONS:
+                try:
+                    self._json(PY_ACTIONS[name]())
+                except Exception as e:
+                    self._json({"ok": False, "error": str(e)}, code=500)
+                return
             cmd = ALLOWED_ACTIONS.get(name)
             if cmd is None:
                 self._json({"ok": False, "error": "unknown action: " + name}, code=404)
@@ -1404,7 +2049,104 @@ class Handler(BaseHTTPRequestHandler):
             self.send_header("Content-Length", "0")
             self.end_headers()
 
+    def _handle_session(self):
+        full = self.path[len("/session/"):]
+        rest, _, query = full.partition("?")
+        parts = [p for p in rest.split("/") if p]
+        if len(parts) < 2:
+            self._json({"error": "bad request"}, code=400)
+            return
+        name, what = parts[0], parts[1]
+        sdir = _safe_session_dir(name)
+        if sdir is None:
+            self._json({"error": "no such session"}, code=404)
+            return
+        method = "texture"
+        for kv in query.split("&"):
+            if kv.startswith("method="):
+                method = kv[len("method="):]
+        if method not in ("texture", "color"):
+            method = "texture"
+        if what == "manifest":
+            man = _read_json_file(os.path.join(sdir, "manifest.json"))
+            self._json(man if man is not None else {})
+        elif what == "telemetry":
+            cols, rows = _read_telemetry(sdir)
+            self._send(json.dumps({"columns": cols or [], "rows": rows or []}).encode(),
+                       "application/json")
+        elif what == "events":
+            txt = _read_text_file(os.path.join(sdir, "events.log")) or ""
+            self._send(txt.encode(), "text/plain; charset=utf-8")
+        elif what == "gps":
+            cols, rows = _read_telemetry(sdir)
+            self._send(json.dumps({"points": _gps_points(cols, rows or [])}).encode(),
+                       "application/json")
+        elif what == "frame" and len(parts) >= 3 and parts[2].isdigit():
+            fp = os.path.join(sdir, "frames", "frame_%06d.jpg" % int(parts[2]))
+            if os.path.isfile(fp):
+                try:
+                    with open(fp, "rb") as f:
+                        self._send(f.read(), "image/jpeg")
+                except Exception:
+                    self.send_response(500); self.send_header("Content-Length", "0"); self.end_headers()
+            else:
+                self.send_response(404); self.send_header("Content-Length", "0"); self.end_headers()
+        elif what == "analyze" and len(parts) >= 3 and parts[2].isdigit():
+            # Re-run the pipeline on one saved frame, on the Pi, and return the
+            # annotated overlay. Lets the Analyze tab show processed frames.
+            if not CAMERA_AVAILABLE:
+                self._json({"error": "vision stack unavailable"}, code=503); return
+            fp = os.path.join(sdir, "frames", "frame_%06d.jpg" % int(parts[2]))
+            if not os.path.isfile(fp):
+                self.send_response(404); self.send_header("Content-Length", "0"); self.end_headers(); return
+            try:
+                img = cv2.imread(fp)            # BGR, matches how frames were saved
+                res = analyze(img, is_rgb=False, method=method)
+                vis = annotate(img, res, is_rgb=False)
+                ok, buf = cv2.imencode(".jpg", vis, [int(cv2.IMWRITE_JPEG_QUALITY), 85])
+                if not ok:
+                    raise RuntimeError("encode failed")
+                self._send(buf.tobytes(), "image/jpeg")
+            except Exception as e:
+                self._json({"error": str(e)}, code=500)
+        elif what == "reanalyze":
+            # Re-run the pipeline over the whole session with the chosen method and
+            # return the recomputed center-water series + summary, for comparison.
+            if not CAMERA_AVAILABLE:
+                self._json({"error": "vision stack unavailable"}, code=503); return
+            centers, zones, i = [], [], 0
+            while i < 20000:
+                fp = os.path.join(sdir, "frames", "frame_%06d.jpg" % i)
+                if not os.path.isfile(fp):
+                    break
+                img = cv2.imread(fp)
+                if img is None:
+                    break
+                try:
+                    res = analyze(img, is_rgb=False, method=method)
+                    centers.append(round(float(res.center_depth_pct), 1))
+                    zones.append(int(res.best_zone))
+                except Exception:
+                    centers.append(None); zones.append(None)
+                i += 1
+            valid = [c for c in centers if c is not None]
+            hist = [0, 0, 0, 0, 0]
+            for z in zones:
+                if z is not None and 0 <= z < 5:
+                    hist[z] += 1
+            self._json({"method": method, "frames": len(centers), "center": centers,
+                        "best_zone_hist": hist,
+                        "avg_center": round(sum(valid) / len(valid), 1) if valid else None})
+        else:
+            self._json({"error": "unknown resource"}, code=404)
+
     def do_GET(self):
+        if self.path == "/sessions" or self.path.startswith("/sessions?"):
+            self._send(json.dumps(_list_sessions()).encode(), "application/json")
+            return
+        if self.path.startswith("/session/"):
+            self._handle_session()
+            return
         if self.path.startswith("/data"):
             with alock:
                 body = json.dumps({
@@ -1441,7 +2183,9 @@ class Handler(BaseHTTPRequestHandler):
                 st = {"recording": cap["recording"], "frames": cap["frames"],
                       "elapsed": round(time.monotonic() - cap["started"], 1) if cap["recording"] else 0,
                       "session": os.path.basename(cap["session"]) if cap["session"] else None,
-                      "free_mb": cap["free_mb"], "error": cap["error"]}
+                      "free_mb": cap["free_mb"], "error": cap["error"],
+                      "last_session": cap["last_session"], "last_frames": cap["last_frames"],
+                      "last_duration": cap["last_duration"]}
             self._send(json.dumps(st).encode(), "application/json")
         elif self.path.startswith("/frame"):
             with flock:

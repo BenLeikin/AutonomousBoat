@@ -29,6 +29,8 @@ DEFAULT_METHOD = "texture"   # "texture" (smoothness-based) or "color" (legacy H
 TEXTURE_WINDOW = 9           # local window (px) for texture-energy smoothing
 VERT_CLOSE = 15              # vertical close (px) to bridge in-column reflection/glare holes
 DEPTH_SMOOTH = 15            # cross-column median window to repair reflection-spiked columns
+CONNECT_FROM_BOTTOM = True   # keep only water connected to the frame bottom, dropping
+                             # floating false-water patches (tile faces, surface reflections)
 
 
 @dataclass
@@ -92,6 +94,29 @@ def _bridge_columns(mask, k=VERT_CLOSE):
     if k <= 1:
         return mask
     return cv2.morphologyEx(mask, cv2.MORPH_CLOSE, np.ones((k, 1), np.uint8))
+
+
+def _keep_bottom_connected(mask):
+    """Keep only the water connected to the bottom edge of the ROI.
+
+    The boat floats in the water, so the real water body always touches the
+    bottom of the frame. Isolated 'water' blobs that sit above the waterline,
+    smooth tile faces between grout lines, sky, or surface reflections that read
+    as low-texture, are not connected to that body. Dropping anything not
+    reachable from the bottom row stops those false patches from inflating a
+    zone's openness. Run this AFTER _bridge_columns so in-column reflection holes
+    are already closed and the real water stays one connected region.
+    """
+    if mask is None or mask.size == 0:
+        return mask
+    num, labels = cv2.connectedComponents((mask > 0).astype(np.uint8), connectivity=8)
+    if num <= 1:
+        return mask
+    bottom = np.unique(labels[-1, :])
+    bottom = bottom[bottom != 0]
+    if bottom.size == 0:
+        return np.zeros_like(mask)
+    return np.where(np.isin(labels, bottom), np.uint8(255), np.uint8(0))
 
 
 def _smooth_depths(depths, k=DEPTH_SMOOTH):
@@ -170,6 +195,8 @@ def analyze(frame, thresholds=None, is_rgb=False, method=None):
 
     mask = segment_water(roi, method=method, thresholds=thresholds)
     mask = _bridge_columns(mask)
+    if CONNECT_FROM_BOTTOM:
+        mask = _keep_bottom_connected(mask)
     depths = _water_depth_per_column(mask)
     depths = _smooth_depths(depths)
 
