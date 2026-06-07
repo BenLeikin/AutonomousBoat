@@ -26,6 +26,13 @@ except Exception as e:
     print(f"[camera] vision stack unavailable, camera section disabled: {e}")
     CAMERA_AVAILABLE = False
 
+# Module handle to the pipeline so a session manifest can record exactly which
+# segmentation method and parameters produced its data. Optional.
+try:
+    import vision.pipeline as _vp
+except Exception:
+    _vp = None
+
 # GPS is optional too: needs pyserial and a receiver on a USB serial port.
 try:
     import serial
@@ -127,7 +134,8 @@ ROLL_SIGN = 1         # set to -1 if the boat heels the wrong way
 PITCH_SIGN = -1       # flipped: clone IMU reads bow/stern reversed
 YAW_SIGN = 1
 
-att = {"roll": 0.0, "pitch": 0.0, "yaw": 0.0, "hz": 0.0, "ok": False}   # radians + measured Hz
+att = {"roll": 0.0, "pitch": 0.0, "yaw": 0.0, "hz": 0.0, "ok": False,
+       "ax": 0.0, "ay": 0.0, "az": 0.0, "gx": 0.0, "gy": 0.0, "gz": 0.0}  # rad + raw
 alock = threading.Lock()
 
 sysm = {}                                                   # system metrics, shared
@@ -168,9 +176,11 @@ CAPTURE_MIN_FREE_MB = 250         # auto-stop if free space drops below this
 CAPTURE_MIN_FRAMES = 20           # need at least this many frames to trust calibration
 
 cap = {"recording": False, "session": None, "started": 0.0,
-       "frames": 0, "last_save": 0.0, "free_mb": None, "error": None}
+       "frames": 0, "last_save": 0.0, "free_mb": None, "error": None,
+       "stop_reason": None}
 caplock = threading.Lock()
 _cap_fh = {"f": None}             # open telemetry file handle (guarded by caplock)
+_cap_meta = {"d": None}           # session manifest dict in progress (guarded by caplock)
 _cap_hsv = {"n": 0, "h": 0.0, "s": 0.0, "v": 0.0,
             "h2": 0.0, "s2": 0.0, "v2": 0.0}   # pixel-level water HSV sums
 
@@ -213,6 +223,8 @@ def imu_loop():
             att["yaw"] = YAW_SIGN * yaw
             att["hz"] = hz
             att["ok"] = True
+            att["ax"] = ax; att["ay"] = ay; att["az"] = az
+            att["gx"] = gx; att["gy"] = gy; att["gz"] = gz
 
         sleep_left = PERIOD - (time.monotonic() - start)
         if sleep_left > 0:
@@ -270,10 +282,119 @@ def camera_loop():
             proc["zones"] = list(result.zones)
             proc["cam_ok"] = True
 
-        _maybe_capture(frame, result)
+        _maybe_capture(frame, result, fps, latency)
 
 
 # ---------- Capture / data-collection helpers ----------
+# Ordered telemetry columns. cmd_left/cmd_right are reserved for the autonomy
+# controller (blank until it exists) so a session's record already aligns the
+# boat's commanded output with what vision saw, frame for frame.
+TELEMETRY_COLUMNS = [
+    "t_iso", "t_unix", "frame",
+    "fps", "vision_ms",
+    "best_zone", "center_pct", "z0", "z1", "z2", "z3", "z4",
+    "roll_deg", "pitch_deg", "yaw_deg",
+    "ax", "ay", "az", "gx", "gy", "gz", "imu_hz",
+    "pack_v", "rail_v", "current_ma", "power_w",
+    "cpu_pct", "cpu_temp_c", "under_voltage", "throttled_now", "uv_occurred",
+    "gps_fix", "gps_valid", "gps_lat", "gps_lon", "gps_alt_m",
+    "gps_sats", "gps_hdop", "gps_sog_ms", "gps_cog",
+    "cmd_left", "cmd_right",
+]
+
+
+def _fmt(v, nd=None):
+    # CSV cell: blank for None, fixed-decimal for floats, str otherwise.
+    if v is None:
+        return ""
+    if nd is not None:
+        try:
+            return ("%%.%df" % nd) % v
+        except (TypeError, ValueError):
+            return ""
+    if isinstance(v, bool):
+        return "1" if v else "0"
+    return str(v)
+
+
+def _git_commit():
+    try:
+        out = subprocess.run(["git", "-C", "/home/ben/autoboat", "rev-parse", "--short", "HEAD"],
+                             capture_output=True, text=True, timeout=3)
+        return out.stdout.strip() or None
+    except Exception:
+        return None
+
+
+def _pi_model():
+    try:
+        with open("/proc/device-tree/model") as f:
+            return f.read().strip("\x00").strip()
+    except Exception:
+        return None
+
+
+def _pipeline_meta():
+    if _vp is None:
+        return {"available": False}
+    g = lambda k: getattr(_vp, k, None)
+    return {"available": True, "method": g("DEFAULT_METHOD"), "num_zones": g("NUM_ZONES"),
+            "roi_top_frac": g("ROI_TOP_FRAC"), "gap_tolerance": g("GAP_TOLERANCE"),
+            "bottom_skip_max": g("BOTTOM_SKIP_MAX"), "texture_window": g("TEXTURE_WINDOW"),
+            "vert_close": g("VERT_CLOSE"), "depth_smooth": g("DEPTH_SMOOTH")}
+
+
+def _session_meta():
+    # Static run context: enough to reproduce and interpret the data offline.
+    with pwlock:
+        pwr_on = bool(power.get("connected"))
+    with glock:
+        gps_on = bool(gps.get("connected"))
+    with alock:
+        imu_on = bool(att.get("ok"))
+    return {
+        "schema_version": 2,
+        "host": {"hostname": (os.uname().nodename if hasattr(os, "uname") else None),
+                 "pi_model": _pi_model()},
+        "git_commit": _git_commit(),
+        "camera": {"resolution": "320x240",
+                   "note": "picamera2 RGB888 buffer is BGR-ordered; analyze/annotate use is_rgb=False",
+                   "lens": os.environ.get("AUTOBOAT_LENS", "unknown")},
+        "pipeline": _pipeline_meta(),
+        "imu": {"present": IMU_AVAILABLE, "alpha": ALPHA,
+                "roll_sign": ROLL_SIGN, "pitch_sign": PITCH_SIGN, "yaw_sign": YAW_SIGN,
+                "accel_units": "m/s^2", "gyro_units": "rad/s"},
+        "gps": {"present": GPS_AVAILABLE, "receiver": "VK-162 (u-blox 7)", "baud": GPS_BAUD,
+                "note": "consumer GPS ~2.5m CEP; not usable for pool-scale boundaries"},
+        "capture": {"interval_s": CAPTURE_INTERVAL, "min_free_mb": CAPTURE_MIN_FREE_MB,
+                    "jpeg_quality": 90, "data_root": DATA_ROOT},
+        "sensors_online_at_start": {"camera": CAMERA_AVAILABLE, "imu": imu_on,
+                                    "power": pwr_on, "gps": gps_on},
+        "telemetry_columns": TELEMETRY_COLUMNS,
+    }
+
+
+def _cap_event(sdir, msg):
+    # Append a timestamped line to the session event log. Best effort.
+    if not sdir:
+        return
+    try:
+        with open(os.path.join(sdir, "events.log"), "a") as f:
+            f.write("%s  %s\n" % (time.strftime("%Y-%m-%dT%H:%M:%S"), msg))
+    except Exception:
+        pass
+
+
+def _write_manifest(sdir, meta):
+    if not sdir or meta is None:
+        return
+    try:
+        with open(os.path.join(sdir, "manifest.json"), "w") as f:
+            json.dump(meta, f, indent=2)
+    except Exception:
+        pass
+
+
 def _free_mb(path):
     try:
         return shutil.disk_usage(path).free / (1024.0 * 1024.0)
@@ -336,48 +457,77 @@ def capture_start():
         try:
             os.makedirs(os.path.join(sdir, "frames"), exist_ok=True)
             fh = open(os.path.join(sdir, "telemetry.csv"), "w")
-            fh.write("t_iso,t_unix,frame,roll_deg,pitch_deg,yaw_deg,best_zone,"
-                     "center_pct,z0,z1,z2,z3,z4,pack_v,current_ma\n")
+            fh.write(",".join(TELEMETRY_COLUMNS) + "\n")
             fh.flush()
         except Exception as e:
             return {"ok": False, "error": "cannot open session: %s" % e}
         _cap_fh["f"] = fh
         for k in _cap_hsv:
             _cap_hsv[k] = 0 if k == "n" else 0.0
+        meta = _session_meta()
+        meta["session_id"] = name
+        meta["started_iso"] = time.strftime("%Y-%m-%dT%H:%M:%S")
+        meta["free_mb_at_start"] = round(free, 1) if free is not None else None
+        _cap_meta["d"] = meta
+        _write_manifest(sdir, meta)
+        _cap_event(sdir, "capture started (method=%s, lens=%s)" % (
+            (meta["pipeline"] or {}).get("method"), meta["camera"]["lens"]))
         cap.update({"recording": True, "session": sdir, "started": time.monotonic(),
-                    "frames": 0, "last_save": 0.0, "free_mb": free, "error": None})
+                    "frames": 0, "last_save": 0.0, "free_mb": free, "error": None,
+                    "stop_reason": None})
         return {"ok": True, "message": "recording", "session": name}
 
 
-def capture_stop():
+def _finalize_session_locked(reason):
+    # caplock MUST be held. Closes the telemetry file, writes the HSV calibration
+    # and the finalized manifest, logs the stop event. Returns (frames, sdir, calib).
+    cap["recording"] = False
+    cap["stop_reason"] = reason
+    fh = _cap_fh["f"]
+    _cap_fh["f"] = None
+    sdir = cap["session"]
+    frames = cap["frames"]
+    started = cap["started"]
+    if fh:
+        try:
+            fh.flush(); fh.close()
+        except Exception:
+            pass
+    calib = _hsv_calibration() if frames >= CAPTURE_MIN_FRAMES else None
+    if sdir and calib:
+        try:
+            with open(os.path.join(sdir, "water_hsv.json"), "w") as cf:
+                json.dump(calib, cf, indent=2)
+        except Exception:
+            pass
+    meta = _cap_meta["d"]
+    if meta is not None:
+        free = _free_mb(sdir) if sdir else None
+        meta["stopped_iso"] = time.strftime("%Y-%m-%dT%H:%M:%S")
+        meta["duration_s"] = round(time.monotonic() - started, 1) if started else None
+        meta["frames_saved"] = frames
+        meta["stop_reason"] = reason
+        meta["free_mb_at_stop"] = round(free, 1) if free is not None else None
+        meta["water_hsv"] = calib
+        _write_manifest(sdir, meta)
+    _cap_event(sdir, "capture stopped (reason=%s, frames=%d)" % (reason, frames))
+    _cap_meta["d"] = None
+    return frames, sdir, calib
+
+
+def capture_stop(reason="user"):
     with caplock:
         if not cap["recording"]:
             return {"ok": True, "message": "not recording"}
-        cap["recording"] = False
-        fh = _cap_fh["f"]
-        _cap_fh["f"] = None
-        sdir = cap["session"]
-        frames = cap["frames"]
-        if fh:
-            try:
-                fh.flush(); fh.close()
-            except Exception:
-                pass
-        calib = _hsv_calibration() if frames >= CAPTURE_MIN_FRAMES else None
-        if sdir and calib:
-            try:
-                with open(os.path.join(sdir, "water_hsv.json"), "w") as cf:
-                    json.dump(calib, cf, indent=2)
-            except Exception:
-                pass
+        frames, sdir, calib = _finalize_session_locked(reason)
     return {"ok": True, "message": "stopped", "frames": frames,
             "session": os.path.basename(sdir) if sdir else None,
             "calibration": calib}
 
 
-def _maybe_capture(frame_rgb, result):
-    # Called from camera_loop each frame; saves a still + telemetry row at the
-    # configured interval while recording. Does its own locking.
+def _maybe_capture(frame_rgb, result, fps, vision_ms):
+    # Called from camera_loop each frame; saves a still + a full telemetry row at
+    # the configured interval while recording. Does its own locking.
     now = time.monotonic()
     with caplock:
         if not cap["recording"] or (now - cap["last_save"]) < CAPTURE_INTERVAL:
@@ -387,9 +537,21 @@ def _maybe_capture(frame_rgb, result):
         n = cap["frames"]
         with alock:
             roll = math.degrees(att["roll"]); pitch = math.degrees(att["pitch"])
-            yaw = math.degrees(att["yaw"])
+            yaw = math.degrees(att["yaw"]); imu_hz = att["hz"]
+            ax = att["ax"]; ay = att["ay"]; az = att["az"]
+            gx = att["gx"]; gy = att["gy"]; gz = att["gz"]
         with pwlock:
-            pack_v = power["pack_v"]; cur = power["current_ma"]
+            pack_v = power["pack_v"]; rail_v = power["rail_v"]
+            cur = power["current_ma"]; pwr_w = power["power_w"]
+        with slock:
+            cpu_pct = sysm.get("cpu_pct"); cpu_temp = sysm.get("temp_c")
+            uv = sysm.get("under_voltage"); thr = sysm.get("throttled_now")
+            uvo = sysm.get("uv_occurred")
+        with glock:
+            g_fix = gps["fix_type"]; g_valid = gps["valid"]
+            g_lat = gps["lat"]; g_lon = gps["lon"]; g_alt = gps["alt"]
+            g_sats = gps["sats_used"]; g_hdop = gps["hdop"]
+            g_sog = gps["sog_ms"]; g_cog = gps["cog"]
         fname = "frame_%06d.jpg" % n
         try:
             # frame_rgb is already BGR (picamera2 order), which is what imwrite wants.
@@ -397,16 +559,27 @@ def _maybe_capture(frame_rgb, result):
                         [int(cv2.IMWRITE_JPEG_QUALITY), 90])
         except Exception as e:
             cap["error"] = "save failed: %s" % e
+            _cap_event(sdir, "frame save failed at #%d: %s" % (n, e))
             return
         z = list(result.zones)
         if fh:
+            row = [
+                time.strftime("%Y-%m-%dT%H:%M:%S"), _fmt(time.time(), 3), fname,
+                _fmt(fps, 1), _fmt(vision_ms, 1),
+                _fmt(int(result.best_zone)), _fmt(float(result.center_depth_pct), 1),
+                _fmt(z[0]), _fmt(z[1]), _fmt(z[2]), _fmt(z[3]), _fmt(z[4]),
+                _fmt(roll, 1), _fmt(pitch, 1), _fmt(yaw, 1),
+                _fmt(ax, 3), _fmt(ay, 3), _fmt(az, 3),
+                _fmt(gx, 4), _fmt(gy, 4), _fmt(gz, 4), _fmt(imu_hz, 1),
+                _fmt(pack_v, 2), _fmt(rail_v, 2),
+                ("" if cur is None else _fmt(int(round(cur)))), _fmt(pwr_w, 2),
+                _fmt(cpu_pct, 1), _fmt(cpu_temp, 1), _fmt(uv), _fmt(thr), _fmt(uvo),
+                _fmt(g_fix), _fmt(g_valid), _fmt(g_lat, 6), _fmt(g_lon, 6), _fmt(g_alt, 1),
+                _fmt(g_sats), _fmt(g_hdop, 1), _fmt(g_sog, 2), _fmt(g_cog, 1),
+                "", "",  # cmd_left, cmd_right: reserved for the autonomy controller
+            ]
             try:
-                fh.write("%s,%.3f,%s,%.1f,%.1f,%.1f,%d,%.1f,%s,%s,%s,%s,%s,%s,%s\n" % (
-                    time.strftime("%Y-%m-%dT%H:%M:%S"), time.time(), fname,
-                    roll, pitch, yaw, int(result.best_zone), float(result.center_depth_pct),
-                    z[0], z[1], z[2], z[3], z[4],
-                    "" if pack_v is None else round(pack_v, 2),
-                    "" if cur is None else int(round(cur))))
+                fh.write(",".join(row) + "\n")
                 fh.flush()
             except Exception:
                 pass
@@ -417,14 +590,8 @@ def _maybe_capture(frame_rgb, result):
             free = _free_mb(sdir)
             cap["free_mb"] = free
             if free is not None and free < CAPTURE_MIN_FREE_MB:
-                cap["recording"] = False
                 cap["error"] = "stopped: low card space (%.0f MB)" % free
-                if fh:
-                    try:
-                        fh.flush(); fh.close()
-                    except Exception:
-                        pass
-                _cap_fh["f"] = None
+                _finalize_session_locked("low_space")
 
 
 # ---------- GPS / NMEA helpers ----------
@@ -706,7 +873,7 @@ PAGE = b"""<!DOCTYPE html>
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>AutoBoat2w</title>
+<title>AutoBoat</title>
 <style>
   body { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; margin: 0; padding: 18px;
          background: #06090c; color: #c7d2da; }
