@@ -9,6 +9,7 @@ Takes a BGR or RGB frame, returns a navigation summary:
   - center_depth_pct: free water ahead in the center column, as % of frame height
 """
 from dataclasses import dataclass
+import os
 import cv2
 import numpy as np
 
@@ -31,6 +32,35 @@ VERT_CLOSE = 15              # vertical close (px) to bridge in-column reflectio
 DEPTH_SMOOTH = 15            # cross-column median window to repair reflection-spiked columns
 CONNECT_FROM_BOTTOM = True   # keep only water connected to the frame bottom, dropping
                              # floating false-water patches (tile faces, surface reflections)
+
+
+# Optional boat/hull mask. When a wide lens sees the boat's own deck and bows in
+# the lower frame, those pixels must be excluded or the smooth deck reads as water
+# (flooring center depth and disabling blocked-detection). Set AUTOBOAT_BOAT_MASK
+# to a grayscale PNG where white (>127) marks the boat. The standard narrow lens
+# leaves it unset, so this is a no-op there.
+_BOAT_MASK_PATH = os.environ.get("AUTOBOAT_BOAT_MASK")
+_boat_mask_cache = {"path": None, "mask": None}
+
+
+def _load_boat_mask(shape):
+    p = _BOAT_MASK_PATH
+    if not p:
+        return None
+    c = _boat_mask_cache
+    if c["path"] == p and c["mask"] is not None and c["mask"].shape == shape:
+        return c["mask"]
+    try:
+        m = cv2.imread(p, cv2.IMREAD_GRAYSCALE)
+        if m is None:
+            return None
+        if m.shape != shape:
+            m = cv2.resize(m, (shape[1], shape[0]), interpolation=cv2.INTER_NEAREST)
+        c["path"] = p
+        c["mask"] = m > 127
+        return c["mask"]
+    except Exception:
+        return None
 
 
 @dataclass
@@ -135,24 +165,21 @@ def _smooth_depths(depths, k=DEPTH_SMOOTH):
 
 
 def _water_depth_per_column(mask, gap_tolerance=GAP_TOLERANCE,
-                            bottom_skip_max=BOTTOM_SKIP_MAX):
+                            bottom_skip_max=BOTTOM_SKIP_MAX, bottom_offset=None):
     """
     For each column, find the highest contiguous water region from the bottom.
 
-    Tolerates up to `bottom_skip_max` non-water rows at the very bottom
-    of a column before the first water pixel (handles glare strips).
-    Once water is found, tolerates up to `gap_tolerance` consecutive
-    non-water rows (handles reflection holes) before declaring an obstacle.
-
-    Vectorized across columns: iterates rows, applies per-row numpy ops
-    to all columns simultaneously. Matches the original loop's semantics
-    exactly.
+    `bottom_offset` (per-column) is the number of rows at the bottom of each
+    column occupied by the boat's own hull; those rows are skipped so the scan
+    begins above the boat and depth is measured as water rows above the hull.
     """
     h, w = mask.shape
     if h == 0:
         return np.zeros(w, dtype=np.int32)
 
     is_water = (mask > 0)[::-1, :]  # row 0 = bottom of frame
+    if bottom_offset is None:
+        bottom_offset = np.zeros(w, dtype=np.int32)
 
     has_seen_water = np.zeros(w, dtype=bool)
     gap = np.zeros(w, dtype=np.int32)
@@ -160,20 +187,21 @@ def _water_depth_per_column(mask, gap_tolerance=GAP_TOLERANCE,
     stopped = np.zeros(w, dtype=bool)
 
     for r in range(h):
-        is_w = is_water[r, :]
-        active = ~stopped
+        in_hull = r < bottom_offset             # this row is the boat in this column
+        is_w = is_water[r, :] & ~in_hull        # the hull is never water
+        active = ~stopped & ~in_hull            # do not scan within the hull
 
-        # Update gap counter: reset on water, increment on non-water
-        gap = np.where(is_w, 0, gap + 1)
+        # Gap counter advances only outside the hull
+        gap = np.where(in_hull, gap, np.where(is_w, 0, gap + 1))
 
-        # Record water depth where active and this row has water
+        # Depth measured as water rows ABOVE the hull
         water_here = is_w & active
-        depth = np.where(water_here, r + 1, depth)
+        depth = np.where(water_here, (r + 1) - bottom_offset, depth)
         has_seen_water |= water_here
 
-        # Bottom-skip stop: still no water seen and we've exceeded the budget
-        if r >= bottom_skip_max:
-            stopped |= active & (~is_w) & (~has_seen_water)
+        # Bottom-skip budget counts from the top of the hull
+        past_skip = (r - bottom_offset) >= bottom_skip_max
+        stopped |= active & (~is_w) & (~has_seen_water) & past_skip
 
         # Gap-tolerance stop: gap exceeds tolerance after water has been seen
         stopped |= active & has_seen_water & (gap > gap_tolerance)
@@ -195,9 +223,26 @@ def analyze(frame, thresholds=None, is_rgb=False, method=None):
 
     mask = segment_water(roi, method=method, thresholds=thresholds)
     mask = _bridge_columns(mask)
-    if CONNECT_FROM_BOTTOM:
+
+    # Exclude the boat's own hull/deck if a mask is configured (wide lens). Zero
+    # it from the water mask and compute, per column, how many bottom rows are
+    # hull so the depth scan starts above the boat.
+    boat = _load_boat_mask(img_bgr.shape[:2])
+    bottom_offset = None
+    if boat is not None:
+        boat_roi = boat[roi_top:, :]
+        mask[boat_roi] = 0
+        roi_h = mask.shape[0]
+        any_hull = boat_roi.any(axis=0)
+        topmost = np.argmax(boat_roi, axis=0)          # first hull row from the top
+        bottom_offset = np.where(any_hull, roi_h - topmost, 0).astype(np.int32)
+
+    # connect-from-bottom assumes water touches the frame bottom; with the hull
+    # masked there it would drop everything, so it is bypassed when a boat mask
+    # is active.
+    if CONNECT_FROM_BOTTOM and boat is None:
         mask = _keep_bottom_connected(mask)
-    depths = _water_depth_per_column(mask)
+    depths = _water_depth_per_column(mask, bottom_offset=bottom_offset)
     depths = _smooth_depths(depths)
 
     zone_w = full_w // NUM_ZONES

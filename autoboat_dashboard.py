@@ -59,6 +59,20 @@ INA_ADDR = 0x40
 PACK_LOW = 6.6                     # 2S Li, ~3.3 V/cell: head back
 PACK_CRITICAL = 6.0               # 2S Li, ~3.0 V/cell: stop
 
+# Auto-shutdown on a critically low pack, so a dying battery cannot brown out the
+# Pi mid-write and corrupt the SD / session (which is exactly what happened on the
+# 5.7V run). The Pi owns this loop: it counts down and powers itself off even with
+# no browser open. The dashboard overlay only mirrors the state and offers an
+# override. A debounce avoids tripping on a momentary sag, and a snooze lets a
+# watching operator buy time without disabling the protection outright.
+CRITICAL_DEBOUNCE = 5.0           # pack must stay below critical this long before arming
+CRITICAL_GRACE = 30.0             # countdown (s) before poweroff once armed
+CRITICAL_SNOOZE = 120.0           # override delays re-arming this long, then re-checks
+CRITICAL_RECOVER = PACK_CRITICAL + 0.15   # pack must rise above this to fully reset
+
+crit = {"below_since": None, "deadline": None, "snooze_until": None, "fired": False}
+critlock = threading.Lock()
+
 PORT = 8000
 TARGET_HZ = 104                    # loop target; matches the sensor's default ODR
 PERIOD = 1.0 / TARGET_HZ
@@ -254,15 +268,21 @@ def imu_loop():
 # marked spot in camera_loop. All tuning is the CTL_* one-liners below.
 ARMED = False
 
-CTL_EMA = 0.6              # smoothing on turn/throttle each frame (1=raw, 0=frozen)
+CTL_TURN_TAU = 0.6         # smoothing time constant (s). Frame-rate independent: the
+                           # EMA weight is derived from dt each call, so behavior is the
+                           # same at 16fps or 2fps (the old fixed-weight EMA was not).
+CTL_TURN_DWELL = 0.5       # min seconds to hold a turn/straight decision (anti-chatter)
 CTL_DEADBAND = 0.08        # |turn| below this snaps to straight (no twitch)
 CTL_BLOCKED_PCT = 12.0     # center water below this => blocked, enter search
 CTL_CLEAR_PCT = 22.0       # center water at/above this => open enough to run again
 CTL_COMFORT_PCT = 38.0     # this open AND the field flat => hold straight, stop
 CTL_COMFORT_SPREAD = 0.18  #   chasing marginally-deeper edges (the weaving fix)
 CTL_TURN_GAIN = 1.2        # maps the openness centroid [-1,1] to a turn command
-CTL_MAX_THROTTLE = 0.60    # forward cap (fraction of full)
-CTL_MIN_THROTTLE = 0.25    # crawl throttle when the path is only just open
+CTL_TURN_ENTER = 0.30      # break into a turn only when the opening is this off-center
+CTL_TURN_EXIT = 0.12       # once turning, hold it until the opening recenters below this
+CTL_CRUISE = 1.0           # forward throttle when the path is clear (full ahead)
+CTL_TURN_SLOWDOWN = 1.0    # forward backs off this much per unit |turn| (pivot vs arc)
+CTL_MIN_THROTTLE = 0.25    # forward floor while pivoting (keeps a little steerage)
 CTL_SEARCH_TURN = 0.50     # pivot magnitude while searching
 CTL_STUCK_SEC = 5.0        # search longer than this => unstick
 CTL_REVERSE = 0.50         # reverse throttle magnitude during unstick
@@ -271,8 +291,8 @@ CTL_YAW_MIN = 0.15         # rad/s; commanding a pivot but yawing less than this
 CTL_YAW_STUCK_SEC = 2.0    #   ...for this long counts as stuck (ARMED only; needs real motion)
 
 ctl = {"mode": "run", "turn": 0.0, "throttle": 0.0, "left": 0.0, "right": 0.0,
-       "reason": "init", "pivot_dir": 1, "search_since": None,
-       "unstick_until": None, "yaw_low_since": None}
+       "reason": "init", "pivot_dir": 1, "turning": False, "search_since": None,
+       "unstick_until": None, "yaw_low_since": None, "last_t": None, "turn_t": 0.0}
 ctllock = threading.Lock()
 
 
@@ -369,23 +389,43 @@ def control_step(zones, center, yaw_rate, now):
             turn_raw, thr_raw = CTL_SEARCH_TURN * d, 0.0
             reason = "search: blocked, pivoting " + ("right" if d > 0 else "left")
         else:  # run
-            turn_raw = _clamp(CTL_TURN_GAIN * centroid)
-            if center >= CTL_COMFORT_PCT and spread < CTL_COMFORT_SPREAD:
-                turn_raw = 0.0
-                cause = "comfort"
-            elif abs(turn_raw) < CTL_DEADBAND:
-                turn_raw = 0.0
-                cause = "deadband"
-            else:
+            turn_target = _clamp(CTL_TURN_GAIN * centroid)
+            comfort = (center >= CTL_COMFORT_PCT and spread < CTL_COMFORT_SPREAD)
+            if comfort:
+                turn_target = 0.0
+            # Turn hysteresis with a dwell floor: hold straight and only break into
+            # a turn when the opening is clearly off-center (ENTER); once turning,
+            # keep it until the opening recenters (EXIT). The dwell timer forbids
+            # flipping the decision more often than CTL_TURN_DWELL, so the latch
+            # cannot chatter frame-to-frame near the threshold at 16fps.
+            if (now - ctl["turn_t"]) >= CTL_TURN_DWELL:
+                if ctl["turning"]:
+                    if abs(turn_target) < CTL_TURN_EXIT:
+                        ctl["turning"] = False
+                        ctl["turn_t"] = now
+                elif abs(turn_target) > CTL_TURN_ENTER:
+                    ctl["turning"] = True
+                    ctl["turn_t"] = now
+            if ctl["turning"]:
+                turn_raw = turn_target
                 cause = "steer"
+            else:
+                turn_raw = 0.0
+                cause = "comfort" if comfort else "cruise"
             reason = ""   # filled in after smoothing, from the commanded turn
-            openness = _clamp(max(0.0, center) / 50.0, 0.0, 1.0)
-            thr_raw = CTL_MIN_THROTTLE + (CTL_MAX_THROTTLE - CTL_MIN_THROTTLE) * openness
-            thr_raw *= (1.0 - 0.4 * abs(turn_raw))   # ease off in a hard turn
+            # Throttle: full ahead when straight; back off with the turn so the
+            # boat pivots instead of arcing at speed into the wall it is avoiding.
+            thr_raw = max(CTL_MIN_THROTTLE,
+                          CTL_CRUISE * (1.0 - CTL_TURN_SLOWDOWN * abs(turn_raw)))
 
-        # ---- EMA smoothing, then tank mix ----
-        turn = CTL_EMA * turn_raw + (1.0 - CTL_EMA) * ctl["turn"]
-        throttle = CTL_EMA * thr_raw + (1.0 - CTL_EMA) * ctl["throttle"]
+        # ---- frame-rate independent smoothing (time constant), then tank mix ----
+        last_t = ctl["last_t"]
+        dt = (now - last_t) if last_t is not None else (1.0 / 16.0)
+        dt = min(max(dt, 0.005), 0.5)          # clamp first call and any stall
+        ctl["last_t"] = now
+        a_s = dt / (CTL_TURN_TAU + dt)          # EMA weight from dt and tau
+        turn = ctl["turn"] + a_s * (turn_raw - ctl["turn"])
+        throttle = ctl["throttle"] + a_s * (thr_raw - ctl["throttle"])
         left = _clamp(throttle - turn)
         right = _clamp(throttle + turn)
         # Run reason reflects the smoothed command, not the raw decision, so the
@@ -394,8 +434,8 @@ def control_step(zones, center, yaw_rate, now):
             settled = abs(turn) < CTL_DEADBAND
             if cause == "comfort":
                 reason = "run: open and flat, " + ("straight" if settled else "easing straight")
-            elif cause == "deadband":
-                reason = "run: centered" if settled else "run: easing to center"
+            elif cause == "cruise":
+                reason = "run: clear, full ahead" if settled else "run: easing straight, full ahead"
             else:
                 reason = "run: steering toward opening"
         ctl["turn"] = turn
@@ -488,7 +528,7 @@ TELEMETRY_COLUMNS = [
     "cpu_pct", "cpu_temp_c", "under_voltage", "throttled_now", "uv_occurred",
     "gps_fix", "gps_valid", "gps_lat", "gps_lon", "gps_alt_m",
     "gps_sats", "gps_hdop", "gps_sog_ms", "gps_cog",
-    "cmd_left", "cmd_right",
+    "cmd_left", "cmd_right", "cmd_mode",
 ]
 
 
@@ -560,10 +600,13 @@ def _session_meta():
                     "jpeg_quality": 90, "data_root": DATA_ROOT},
         "sensors_online_at_start": {"camera": CAMERA_AVAILABLE, "imu": imu_on,
                                     "power": pwr_on, "gps": gps_on},
-        "controller": {"armed": ARMED, "ema": CTL_EMA, "deadband": CTL_DEADBAND,
+        "controller": {"armed": ARMED, "turn_tau": CTL_TURN_TAU,
+                       "turn_dwell": CTL_TURN_DWELL, "deadband": CTL_DEADBAND,
                        "blocked_pct": CTL_BLOCKED_PCT, "clear_pct": CTL_CLEAR_PCT,
                        "comfort_pct": CTL_COMFORT_PCT, "comfort_spread": CTL_COMFORT_SPREAD,
-                       "turn_gain": CTL_TURN_GAIN, "max_throttle": CTL_MAX_THROTTLE,
+                       "turn_gain": CTL_TURN_GAIN, "turn_enter": CTL_TURN_ENTER,
+                       "turn_exit": CTL_TURN_EXIT, "cruise": CTL_CRUISE,
+                       "turn_slowdown": CTL_TURN_SLOWDOWN,
                        "min_throttle": CTL_MIN_THROTTLE, "search_turn": CTL_SEARCH_TURN,
                        "stuck_sec": CTL_STUCK_SEC, "reverse": CTL_REVERSE,
                        "unstick_sec": CTL_UNSTICK_SEC},
@@ -813,7 +856,8 @@ def _maybe_capture(frame_rgb, result, fps, vision_ms, cmd=None):
                 _fmt(g_sats), _fmt(g_hdop, 1), _fmt(g_sog, 2), _fmt(g_cog, 1),
                 (_fmt(int(round(cmd["left"] * 100))) if cmd else ""),
                 (_fmt(int(round(cmd["right"] * 100))) if cmd else ""),
-                # cmd_left, cmd_right: signed percent from the dry-run controller
+                (cmd["mode"] if cmd else ""),
+                # cmd_left, cmd_right (signed percent) and cmd_mode from the controller
             ]
             try:
                 fh.write(",".join(row) + "\n")
@@ -968,6 +1012,75 @@ def _pack_status(v):
     return "critical"
 
 
+def _do_critical_shutdown():
+    # Finalize any recording first so we do not leave a half-written session
+    # (the brownout signature), then halt the Pi cleanly.
+    try:
+        with caplock:
+            recording = cap["recording"]
+        if recording:
+            capture_stop(reason="battery_critical")
+    except Exception:
+        pass
+    try:
+        subprocess.run(ALLOWED_ACTIONS["shutdown"], capture_output=True, text=True, timeout=10)
+    except Exception:
+        pass
+
+
+def _critical_tick(pack_v):
+    # Called from power_loop each read. Arms a countdown after the pack has been
+    # below critical for CRITICAL_DEBOUNCE, fires the shutdown at the deadline,
+    # and fully resets only once the pack recovers above CRITICAL_RECOVER.
+    if pack_v is None:
+        return
+    now = time.monotonic()
+    fire = False
+    with critlock:
+        snoozed = crit["snooze_until"] is not None and now < crit["snooze_until"]
+        if pack_v < PACK_CRITICAL:
+            if crit["below_since"] is None:
+                crit["below_since"] = now
+            sustained = (now - crit["below_since"]) >= CRITICAL_DEBOUNCE
+            if sustained and not snoozed and crit["deadline"] is None and not crit["fired"]:
+                crit["deadline"] = now + CRITICAL_GRACE
+            if crit["deadline"] is not None and not crit["fired"] and now >= crit["deadline"]:
+                crit["fired"] = True
+                fire = True
+        elif pack_v >= CRITICAL_RECOVER:
+            crit["below_since"] = None
+            crit["deadline"] = None
+            crit["snooze_until"] = None
+            crit["fired"] = False
+    if fire:
+        _do_critical_shutdown()
+
+
+def _critical_status():
+    now = time.monotonic()
+    with critlock:
+        if crit["fired"]:
+            return {"armed": True, "seconds_left": 0, "fired": True}
+        if crit["deadline"] is not None:
+            return {"armed": True, "fired": False,
+                    "seconds_left": max(0, int(round(crit["deadline"] - now)))}
+        snoozed = crit["snooze_until"] is not None and now < crit["snooze_until"]
+        return {"armed": False, "fired": False, "seconds_left": None,
+                "snoozed": snoozed,
+                "snooze_left": (int(round(crit["snooze_until"] - now)) if snoozed else None)}
+
+
+def _critical_override():
+    now = time.monotonic()
+    with critlock:
+        crit["deadline"] = None
+        crit["snooze_until"] = now + CRITICAL_SNOOZE
+    return {"ok": True, "message": "shutdown overridden; battery re-checked in %ds" % int(CRITICAL_SNOOZE)}
+
+
+PY_ACTIONS["critical_override"] = _critical_override
+
+
 def power_loop():
     # Reconnecting reader for the high-side INA219. Pack voltage is bus + shunt
     # (the sensor sits in the battery + lead). On any I2C error it backs off and
@@ -997,6 +1110,7 @@ def power_loop():
                     power["power_w"] = round(ina.power, 3)
                     power["status"] = _pack_status(pack_v)
                     power["last_data"] = time.monotonic()
+                _critical_tick(pack_v)
                 time.sleep(0.5)
         except Exception as e:
             print(f"[power] read error: {e}")
@@ -1261,6 +1375,16 @@ PAGE = b"""<!DOCTYPE html>
 </style>
 </head>
 <body>
+<div id="crit_overlay" style="display:none; position:fixed; inset:0; z-index:9999;
+     background:rgba(45,5,5,0.94); align-items:center; justify-content:center; text-align:center;">
+  <div style="max-width:540px; padding:30px;">
+    <div style="font-size:34px; font-weight:700; color:#ff5a5a; letter-spacing:1px;">BATTERY CRITICAL</div>
+    <div style="margin:16px 0 24px; color:#f0d2d2; font-size:16px;">
+      Shutting down in <span id="crit_secs">--</span>s to protect the pack and avoid SD corruption.</div>
+    <button id="crit_override" style="font-size:16px; padding:12px 22px; cursor:pointer;">Override (delay 2 min)</button>
+    <div id="crit_note" style="margin-top:12px; color:#c9a3a3; font-size:13px;"></div>
+  </div>
+</div>
 <div class="tabbar">
   <span class="brand">AutoBoat</span>
   <button class="tab active" data-tab="live" onclick="showTab('live')">Live</button>
@@ -1396,6 +1520,8 @@ PAGE = b"""<!DOCTYPE html>
       <canvas class="achart" id="an_c_power"></canvas>
       <div class="label" style="margin-top:14px">ROLL / PITCH (deg)</div>
       <canvas class="achart" id="an_c_att"></canvas>
+      <div class="label" style="margin-top:14px">MOTOR COMMANDS % &mdash; left (green), right (blue), turn (amber). Dry-run.</div>
+      <canvas class="achart" id="an_c_motor"></canvas>
     </div>
 
     <h2>GPS track</h2>
@@ -1456,7 +1582,14 @@ function anBuildSeries(){
   const rows=_anData.rows;
   function ser(n){ const i=_anData.cols.indexOf(n); const out=[]; if(i<0) return out;
     for(let k=0;k<rows.length;k++){ const v=parseFloat(rows[k][i]); if(!isNaN(v)) out.push({x:k,y:v}); } return out; }
-  _anData.series={ center:ser('center_pct'), pack:ser('pack_v'), roll:ser('roll_deg'), pitch:ser('pitch_deg') };
+  // turn is the steering component, reconstructed from the tank-mixed motor pair:
+  // left = throttle - turn, right = throttle + turn  =>  turn = (right - left) / 2
+  const li=_anData.cols.indexOf('cmd_left'), ri=_anData.cols.indexOf('cmd_right');
+  const turn=[]; if(li>=0&&ri>=0){ for(let k=0;k<rows.length;k++){
+    const l=parseFloat(rows[k][li]), r=parseFloat(rows[k][ri]);
+    if(!isNaN(l)&&!isNaN(r)) turn.push({x:k,y:(r-l)/2}); } }
+  _anData.series={ center:ser('center_pct'), pack:ser('pack_v'), roll:ser('roll_deg'),
+                   pitch:ser('pitch_deg'), mleft:ser('cmd_left'), mright:ser('cmd_right'), turn:turn };
 }
 function anRenderSummary(){
   const m=_anData.man||{}, rows=_anData.rows;
@@ -1519,6 +1652,9 @@ function anRenderCharts(cursor){
   drawChart(document.getElementById('an_c_center'),centerSeries,{ymin:0,ymax:100,cursorX:cursor});
   drawChart(document.getElementById('an_c_power'),[{data:s.pack,color:'#d9b13a'}],{cursorX:cursor});
   drawChart(document.getElementById('an_c_att'),[{data:s.roll,color:'#3fd0a8'},{data:s.pitch,color:'#5aa9e6'}],{cursorX:cursor});
+  drawChart(document.getElementById('an_c_motor'),
+            [{data:s.mleft,color:'#3fd0a8'},{data:s.mright,color:'#5aa9e6'},{data:s.turn,color:'#d9b13a'}],
+            {ymin:-100,ymax:100,cursorX:cursor});
 }
 function anSetupFrames(){
   const slider=document.getElementById('an_slider'), n=_anData.rows.length;
@@ -1540,7 +1676,8 @@ function anShowFrame(idx){
   const fields=[['center_pct','center %'],['best_zone','best zone'],
     ['z0','z0'],['z1','z1'],['z2','z2'],['z3','z3'],['z4','z4'],
     ['roll_deg','roll'],['pitch_deg','pitch'],['yaw_deg','yaw'],
-    ['pack_v','pack V'],['current_ma','current mA'],['cpu_temp_c','cpu C'],['under_voltage','undervolt']];
+    ['pack_v','pack V'],['current_ma','current mA'],['cpu_temp_c','cpu C'],['under_voltage','undervolt'],
+    ['cmd_mode','mode'],['cmd_left','L %'],['cmd_right','R %']];
   document.getElementById('an_kv').innerHTML=fields.map(function(f){
     const i=_anData.cols.indexOf(f[0]); const v=(i>=0&&i<r.length&&r[i]!=='')? r[i]:'--';
     return '<div>'+f[1]+'</div><div>'+v+'</div>'; }).join('');
@@ -1921,6 +2058,11 @@ async function powerTick(){
   let d;
   try { d=await (await fetch('/power',{cache:'no-store'})).json(); }
   catch(e){ return; }
+  const cr=d.critical, ov=document.getElementById('crit_overlay');
+  if(cr && cr.armed){
+    document.getElementById('crit_secs').textContent=(cr.seconds_left!=null?cr.seconds_left:0);
+    ov.style.display='flex';
+  } else { ov.style.display='none'; }
   const s=document.getElementById('pw_status');
   if(!d.connected){
     set('pw_pack','--','#7d96a3'); set('pw_cur','--','#7d96a3');
@@ -1980,6 +2122,13 @@ async function capToggle(){
 }
 document.getElementById('cap_btn').onclick = capToggle;
 makeControls();
+document.getElementById('crit_override').onclick=async function(){
+  const note=document.getElementById('crit_note');
+  note.textContent='overriding...';
+  try{ const r=await (await fetch('/action/critical_override',{method:'POST'})).json();
+       note.textContent=r.message||(r.ok?'overridden':'override failed'); }
+  catch(e){ note.textContent='override failed: '+e.message; }
+};
 setInterval(attTick, 50); attTick();
 setInterval(sysTick, 1500); sysTick();
 setInterval(procTick, 500); procTick();
@@ -2177,6 +2326,7 @@ class Handler(BaseHTTPRequestHandler):
                 data = dict(power)
             ld = data.pop("last_data", 0.0)
             data["age_s"] = round(time.monotonic() - ld, 1) if (data["connected"] and ld) else None
+            data["critical"] = _critical_status()
             self._send(json.dumps(data).encode(), "application/json")
         elif self.path.startswith("/capture"):
             with caplock:
