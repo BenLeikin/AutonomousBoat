@@ -873,7 +873,7 @@ PAGE = b"""<!DOCTYPE html>
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>AutoBoat</title>
+<title>AutoBoat2w</title>
 <style>
   body { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; margin: 0; padding: 18px;
          background: #06090c; color: #c7d2da; }
@@ -914,7 +914,7 @@ PAGE = b"""<!DOCTYPE html>
 </style>
 </head>
 <body>
-<h1>AutoBoat2w</h1>
+<h1>AutoBoat</h1>
 <div class="metrics">
   <div class="card"><div class="k">IMU RATE</div><div class="v" id="m_hz">--</div></div>
   <div class="card"><div class="k">CPU TEMP</div><div class="v" id="m_temp">--</div></div>
@@ -926,17 +926,21 @@ PAGE = b"""<!DOCTYPE html>
   <div class="card"><div class="k">WIFI</div><div class="v" id="m_wifi">--</div></div>
   <div class="card"><div class="k">IP</div><div class="v" id="m_ip">--</div></div>
 </div>
+<div class="metrics" style="grid-template-columns: repeat(4, minmax(0, 1fr));">
+  <div class="card"><div class="k">PACK</div><div class="v" id="pw_pack">--</div></div>
+  <div class="card"><div class="k">CURRENT</div><div class="v" id="pw_cur">--</div></div>
+  <div class="card"><div class="k">POWER</div><div class="v" id="pw_w">--</div></div>
+  <div class="card"><div class="k">RAIL</div><div class="v" id="pw_rail">--</div></div>
+</div>
 <div class="status" id="m_power">power: --</div>
+<div class="ctrl-status" id="pw_status">pack --</div>
 
-<h2>Power</h2>
+<h2>Capture</h2>
 <div class="panel">
-  <div class="metrics" style="grid-template-columns: repeat(auto-fit, minmax(120px, 1fr));">
-    <div class="card"><div class="k">PACK</div><div class="v" id="pw_pack">--</div></div>
-    <div class="card"><div class="k">CURRENT</div><div class="v" id="pw_cur">--</div></div>
-    <div class="card"><div class="k">POWER</div><div class="v" id="pw_w">--</div></div>
-    <div class="card"><div class="k">RAIL</div><div class="v" id="pw_rail">--</div></div>
+  <div class="btn-row">
+    <button class="btn" id="cap_btn">Start capture</button>
   </div>
-  <div class="ctrl-status" id="pw_status">pack --</div>
+  <div class="ctrl-status" id="cap_status">idle</div>
 </div>
 
 <h2>Camera &amp; Vision</h2>
@@ -954,14 +958,6 @@ PAGE = b"""<!DOCTYPE html>
       <div class="card"><div class="k">CENTER WATER</div><div class="v" id="p_center">--</div></div>
     </div>
   </div>
-</div>
-
-<h2>Capture</h2>
-<div class="panel">
-  <div class="btn-row">
-    <button class="btn" id="cap_btn">Start capture</button>
-  </div>
-  <div class="ctrl-status" id="cap_status">idle</div>
 </div>
 
 <h2>GPS</h2>
