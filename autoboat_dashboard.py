@@ -1,89 +1,47 @@
-import time
-import math
+"""AutoBoat dashboard: the HTTP server and nothing else.
+
+Serves the web UI from static/index.html, exposes the read endpoints over each
+subsystem's shared state, routes actions to the modules that own them, and
+starts the polling threads. All actual function lives in its module:
+
+    control/controller.py   avoidance brain (hardware-free, unit-tested)
+    pilot.py                 camera loop: vision -> controller -> motors, Start/Stop
+    recording.py             session capture, telemetry, Analyze-tab readers
+    hardware/imu.py          MPU-6050 attitude
+    hardware/motors.py       DRV8833 actuation, trim, watchdog, ARMED
+    hardware/power.py        INA219 pack monitor, critical shutdown, hard guard
+    hardware/gps.py          VK-162 NMEA reader
+    hardware/tof.py          VL53L1X forward range
+    hardware/sysmon.py       CPU/mem/wifi/throttle metrics
+"""
 import json
-import glob
-import re
+import math
 import os
-import shutil
-import threading
 import subprocess
 import sys
+import threading
+import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-import board
-import busio
-from adafruit_bus_device.i2c_device import I2CDevice
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-# Vision stack is optional: if it's missing (e.g. running this dashboard on a
-# box without picamera2/opencv), the camera section just shows "--" and the
-# IMU + system parts still work.
-sys.path.insert(0, "/home/ben/autoboat")
-try:
-    import cv2
-    from picamera2 import Picamera2
-    from vision.pipeline import analyze, annotate
-    CAMERA_AVAILABLE = True
-except Exception as e:
-    print(f"[camera] vision stack unavailable, camera section disabled: {e}")
-    CAMERA_AVAILABLE = False
-
-# Module handle to the pipeline so a session manifest can record exactly which
-# segmentation method and parameters produced its data. Optional.
-try:
-    import vision.pipeline as _vp
-except Exception:
-    _vp = None
-
-# GPS is optional too: needs pyserial and a receiver on a USB serial port.
-try:
-    import serial
-    GPS_AVAILABLE = True
-except ImportError:
-    GPS_AVAILABLE = False
-    print("[gps] pyserial not installed; GPS section disabled "
-          "(pip install pyserial --break-system-packages)")
-
-# INA219 pack monitor is optional: it lives on the software I2C bus created by
-# the i2c-gpio overlay (SDA=GPIO5, SCL=GPIO6 -> /dev/i2c-3). On a box without
-# that bus or the libraries, the Power section just shows "sensor offline".
-try:
-    from adafruit_extended_bus import ExtendedI2C
-    from adafruit_ina219 import INA219
-    INA_AVAILABLE = True
-except Exception as e:
-    INA_AVAILABLE = False
-    print(f"[power] INA219 libs unavailable, power section disabled: {e}")
-
-INA_BUS = 3                        # /dev/i2c-3, the i2c-gpio bus on GPIO5/6
-INA_ADDR = 0x40
-PACK_LOW = 6.6                     # 2S Li, ~3.3 V/cell: head back
-PACK_CRITICAL = 6.0               # 2S Li, ~3.0 V/cell: stop
-
-# Auto-shutdown on a critically low pack, so a dying battery cannot brown out the
-# Pi mid-write and corrupt the SD / session (which is exactly what happened on the
-# 5.7V run). The Pi owns this loop: it counts down and powers itself off even with
-# no browser open. The dashboard overlay only mirrors the state and offers an
-# override. A debounce avoids tripping on a momentary sag, and a snooze lets a
-# watching operator buy time without disabling the protection outright.
-CRITICAL_DEBOUNCE = 5.0           # pack must stay below critical this long before arming
-CRITICAL_GRACE = 30.0             # countdown (s) before poweroff once armed
-CRITICAL_SNOOZE = 120.0           # override delays re-arming this long, then re-checks
-CRITICAL_RECOVER = PACK_CRITICAL + 0.15   # pack must rise above this to fully reset
-
-crit = {"below_since": None, "deadline": None, "snooze_until": None, "fired": False}
-critlock = threading.Lock()
+import hardware.imu as imu
+import hardware.gps as hwgps
+import hardware.power as hwpower
+import hardware.sysmon as sysmon
+import hardware.tof as hwtof
+import hardware.motors as motors
+import recording
+import pilot
 
 PORT = 8000
-TARGET_HZ = 104                    # loop target; matches the sensor's default ODR
-PERIOD = 1.0 / TARGET_HZ
-GPS_BAUD = 9600                    # VK-162 default (u-blox 7, 8N1)
+STATIC_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "static")
 
-# ---------- Control actions ----------
+# ---------- Shell actions ----------
 # Shell-level actions the dashboard is allowed to run. Each needs a matching
-# button entry in the CONTROLS array on the page (see PAGE below).
+# button entry in the CONTROLS array on the page (static/index.html).
 # These use `sudo -n` (non-interactive): if passwordless sudo is not set up for
 # the command, it fails fast and the button reports "sudo: a password is required".
-# Verify the systemctl path on your Pi with `which systemctl` and adjust if needed.
 ALLOWED_ACTIONS = {
     "reboot": ["sudo", "-n", "systemctl", "reboot"],
     "shutdown": ["sudo", "-n", "systemctl", "poweroff"],
@@ -91,2064 +49,45 @@ ALLOWED_ACTIONS = {
     # this very process; otherwise we can get killed mid-stop and the unit never
     # comes back. Needs a sudoers line allowing this exact command.
     "restart": ["sudo", "-n", "systemctl", "--no-block", "restart", "autoboat-dashboard"],
-    # Add more shell actions here. Control-loop actions (emergency stop, start/stop
-    # recording) are not shell commands; wire those to the control loop / logger
-    # once those subsystems exist, then add a matching CONTROLS button.
 }
 
-# ---------- IMU ----------
-# Minimal MPU-6050 driver that does NOT gate on the WHO_AM_I id, so it works with
-# the genuine chip and with the common clone modules that report a different id
-# (those make the stock adafruit_mpu6050 raise "Failed to find MPU6050"). Units
-# match the old LSM6DSO: acceleration m/s^2, gyro rad/s, so the filter is unchanged.
-class MPU6050:
-    _G = 9.80665
-    _DEG2RAD = math.pi / 180.0
-
-    def __init__(self, i2c, address=0x68):
-        self._dev = I2CDevice(i2c, address)
-        self._buf = bytearray(6)
-        self._write(0x6B, 0x00)   # PWR_MGMT_1: wake from sleep
-        self._write(0x1A, 0x04)   # CONFIG: DLPF ~21 Hz, tames vibration
-        self._write(0x1B, 0x00)   # GYRO_CONFIG:  +/-250 deg/s  (131 LSB/dps)
-        self._write(0x1C, 0x00)   # ACCEL_CONFIG: +/-2 g        (16384 LSB/g)
-
-    def _write(self, reg, val):
-        with self._dev as d:
-            d.write(bytes([reg, val]))
-
-    def _read3(self, reg):
-        with self._dev as d:
-            d.write_then_readinto(bytes([reg]), self._buf)
-        out = []
-        for i in range(3):
-            v = (self._buf[2 * i] << 8) | self._buf[2 * i + 1]
-            out.append(v - 65536 if v >= 32768 else v)
-        return out
-
-    @property
-    def acceleration(self):
-        x, y, z = self._read3(0x3B)
-        return (x / 16384.0 * self._G, y / 16384.0 * self._G, z / 16384.0 * self._G)
-
-    @property
-    def gyro(self):
-        x, y, z = self._read3(0x43)
-        return (x / 131.0 * self._DEG2RAD, y / 131.0 * self._DEG2RAD,
-                z / 131.0 * self._DEG2RAD)
-
-
-sensor = None
-try:
-    i2c = busio.I2C(board.SCL, board.SDA)
-    sensor = MPU6050(i2c, address=0x68)
-    IMU_AVAILABLE = True
-except Exception as e:
-    print(f"[imu] MPU6050 not found, attitude section disabled: {e}")
-    IMU_AVAILABLE = False
-
-# ---------- Complementary filter config ----------
-ALPHA = 0.98          # near 1.0: gyro short-term, accel long-term (drift kill)
-ROLL_SIGN = 1         # set to -1 if the boat heels the wrong way
-PITCH_SIGN = -1       # flipped: clone IMU reads bow/stern reversed
-YAW_SIGN = 1
-
-att = {"roll": 0.0, "pitch": 0.0, "yaw": 0.0, "hz": 0.0, "ok": False,
-       "ax": 0.0, "ay": 0.0, "az": 0.0, "gx": 0.0, "gy": 0.0, "gz": 0.0}  # rad + raw
-alock = threading.Lock()
-imu_cmd = {"zero_yaw": False}     # set by the Zero-heading control; read in imu_loop
-
-sysm = {}                                                   # system metrics, shared
-slock = threading.Lock()
-
-# ---------- Camera + vision shared state ----------
-proc = {"fps": 0.0, "latency_ms": 0.0, "best_zone": 0,
-        "center_pct": 0.0, "zones": [0, 0, 0, 0, 0], "cam_ok": False,
-        "cmd": {"mode": "run", "turn": 0.0, "throttle": 0.0, "left": 0.0,
-                "right": 0.0, "reason": "idle", "armed": False}}
-plock = threading.Lock()
-frame_buf = {"jpeg": None}
-flock = threading.Lock()
-raw_buf = {"frame": None}         # latest raw BGR frame, for on-demand snapshots
-rlock = threading.Lock()
-
-# ---------- GPS shared state ----------
-gps = {"connected": False, "fix_type": "none", "valid": False,
-       "sats_used": None, "sats_view": None, "lat": None, "lon": None,
-       "alt": None, "hdop": None, "sog_ms": None, "cog": None,
-       "utc": None, "date": None, "last_data": 0.0}
-glock = threading.Lock()
-
-# ---------- INA219 pack monitor shared state ----------
-power = {"connected": False, "pack_v": None, "rail_v": None,
-         "current_ma": None, "power_w": None, "status": "--", "last_data": 0.0}
-pwlock = threading.Lock()
-
-# ---------- Capture / data-collection state ----------
-# Records raw frames + synced telemetry to a session folder for offline tuning
-# and labeling, and accumulates a water-HSV sample to suggest segmentation
-# thresholds for the vision pipeline. Started and stopped from the dashboard.
-# NOTE: writes to the SD card. Keep the read-only overlay OFF during capture, or
-# the frames land in RAM and vanish on reboot. There's a free-space guard below.
-# Data store matches setup_data_store.sh: $AUTOBOAT_DATA (default ~/autoboat-data)
-# with sessions/ for run recordings (frames + CSV) and captures/ for curated
-# stills. Raw move-around recordings go to sessions/; curate stills yourself.
-DATA_ROOT = os.environ.get("AUTOBOAT_DATA") or os.path.expanduser("~/autoboat-data")
-CAPTURE_ROOT = os.path.join(DATA_ROOT, "sessions")
-CAPTURE_INTERVAL = 0.5            # seconds between saved stills (~2 fps)
-CAPTURE_MIN_FREE_MB = 250         # auto-stop if free space drops below this
-CAPTURE_MIN_FRAMES = 20           # need at least this many frames to trust calibration
-
-cap = {"recording": False, "session": None, "started": 0.0,
-       "frames": 0, "last_save": 0.0, "free_mb": None, "error": None,
-       "stop_reason": None,
-       "last_session": None, "last_frames": 0, "last_duration": 0.0}
-caplock = threading.Lock()
-_cap_fh = {"f": None}             # open telemetry file handle (guarded by caplock)
-_cap_meta = {"d": None}           # session manifest dict in progress (guarded by caplock)
-_cap_hsv = {"n": 0, "h": 0.0, "s": 0.0, "v": 0.0,
-            "h2": 0.0, "s2": 0.0, "v2": 0.0}   # pixel-level water HSV sums
-
-
-def imu_loop():
-    roll = pitch = yaw = 0.0
-    t = time.monotonic()
-    count = 0
-    win = t
-    hz = 0.0
-    while True:
-        start = time.monotonic()
-        try:
-            ax, ay, az = sensor.acceleration      # m/s^2
-            gx, gy, gz = sensor.gyro              # rad/s
-        except OSError:
-            time.sleep(0.01)
-            continue
-
-        now = time.monotonic()
-        dt = now - t
-        t = now
-
-        roll_acc = math.atan2(ay, az)
-        pitch_acc = math.atan2(-ax, math.sqrt(ay * ay + az * az))
-
-        roll = ALPHA * (roll + gx * dt) + (1 - ALPHA) * roll_acc
-        pitch = ALPHA * (pitch + gy * dt) + (1 - ALPHA) * pitch_acc
-        yaw += gz * dt
-
-        count += 1
-        if now - win >= 1.0:
-            hz = count / (now - win)              # actual measured loop rate
-            count = 0
-            win = now
-
-        with alock:
-            if imu_cmd["zero_yaw"]:
-                yaw = 0.0
-                imu_cmd["zero_yaw"] = False
-            att["roll"] = ROLL_SIGN * roll
-            att["pitch"] = PITCH_SIGN * pitch
-            att["yaw"] = YAW_SIGN * yaw
-            att["hz"] = hz
-            att["ok"] = True
-            att["ax"] = ax; att["ay"] = ay; att["az"] = az
-            att["gx"] = gx; att["gy"] = gy; att["gz"] = gz
-
-        sleep_left = PERIOD - (time.monotonic() - start)
-        if sleep_left > 0:
-            time.sleep(sleep_left)
-
-
-# ---------- Controller (dry-run) ----------
-# Reactive obstacle avoidance, no goal heading. It reads the vision zones and
-# the center water depth, decides a turn and throttle, tank-mixes them into
-# left/right motor commands, and logs them. It does NOT drive anything: ARMED is
-# False, so the actuation point in camera_loop is a no-op. Arming later means
-# setting ARMED True and mapping cmd["left"]/cmd["right"] to the DRV8833 at the
-# marked spot in camera_loop. All tuning is the CTL_* one-liners below.
-ARMED = False
-
-CTL_TURN_TAU = 0.6         # smoothing time constant (s). Frame-rate independent: the
-                           # EMA weight is derived from dt each call, so behavior is the
-                           # same at 16fps or 2fps (the old fixed-weight EMA was not).
-CTL_TURN_DWELL = 0.5       # min seconds to hold a turn/straight decision (anti-chatter)
-CTL_DEADBAND = 0.08        # |turn| below this snaps to straight (no twitch)
-CTL_BLOCKED_PCT = 12.0     # center water below this => blocked, enter search
-CTL_CLEAR_PCT = 22.0       # center water at/above this => open enough to run again
-CTL_COMFORT_PCT = 38.0     # this open AND the field flat => hold straight, stop
-CTL_COMFORT_SPREAD = 0.18  #   chasing marginally-deeper edges (the weaving fix)
-CTL_TURN_GAIN = 1.2        # maps the openness centroid [-1,1] to a turn command
-CTL_TURN_ENTER = 0.30      # break into a turn only when the opening is this off-center
-CTL_TURN_EXIT = 0.12       # once turning, hold it until the opening recenters below this
-CTL_CRUISE = 1.0           # forward throttle when the path is clear (full ahead)
-CTL_TURN_SLOWDOWN = 1.0    # forward backs off this much per unit |turn| (pivot vs arc)
-CTL_MIN_THROTTLE = 0.25    # forward floor while pivoting (keeps a little steerage)
-CTL_SEARCH_TURN = 0.50     # pivot magnitude while searching
-CTL_STUCK_SEC = 5.0        # search longer than this => unstick
-CTL_REVERSE = 0.50         # reverse throttle magnitude during unstick
-CTL_UNSTICK_SEC = 1.2      # how long the unstick reverse lasts
-CTL_YAW_MIN = 0.15         # rad/s; commanding a pivot but yawing less than this...
-CTL_YAW_STUCK_SEC = 2.0    #   ...for this long counts as stuck (ARMED only; needs real motion)
-
-ctl = {"mode": "run", "turn": 0.0, "throttle": 0.0, "left": 0.0, "right": 0.0,
-       "reason": "init", "pivot_dir": 1, "turning": False, "search_since": None,
-       "unstick_until": None, "yaw_low_since": None, "last_t": None, "turn_t": 0.0}
-ctllock = threading.Lock()
-
-
-def _analyze_zones(zones):
-    """Pure. Turn the 5 zone depths into a steering signal.
-
-    Returns the openness-weighted centroid of the zones mapped onto [-1, 1]
-    (left to right) and the field flatness. Weights are squared so the boat
-    commits to the single dominant opening instead of averaging two separate
-    gaps into the obstacle between them. Because the zone positions are
-    symmetric about 0, equal openness yields a centroid of 0 (straight): a
-    fully open or saturated field does not manufacture a turn the way picking
-    argmax(best_zone) does. `spread` is (max-min)/max, a 0..1 flatness measure
-    the comfort gate uses to decide the field is uniform enough to just hold.
-    """
-    z = [max(0.0, float(v)) for v in zones]
-    n = len(z)
-    if n == 0:
-        return {"centroid": 0.0, "zmax": 0.0, "spread": 0.0}
-    zmax = max(z)
-    if n == 1 or zmax <= 0.0:
-        return {"centroid": 0.0, "zmax": zmax, "spread": 0.0}
-    pos = [(-1.0 + 2.0 * i / (n - 1)) for i in range(n)]   # zone centers on [-1,1]
-    w = [v * v for v in z]
-    wsum = sum(w)
-    centroid = sum(p * wi for p, wi in zip(pos, w)) / wsum if wsum > 0 else 0.0
-    spread = (zmax - min(z)) / zmax
-    return {"centroid": centroid, "zmax": zmax, "spread": spread}
-
-
-def _clamp(x, lo=-1.0, hi=1.0):
-    return lo if x < lo else hi if x > hi else x
-
-
-def control_step(zones, center, yaw_rate, now):
-    """Stateful reactive controller. Mutates `ctl` under lock, returns the
-    command dict (mode/turn/throttle/left/right/reason/armed). Computes and logs
-    only; with ARMED False nothing is actuated. `center` is center_depth_pct,
-    `yaw_rate` is rad/s (only used for the ARMED stuck check)."""
-    a = _analyze_zones(zones)
-    centroid = a["centroid"]
-    spread = a["spread"]
-    blocked = center < CTL_BLOCKED_PCT
-    clear = center >= CTL_CLEAR_PCT
-
-    with ctllock:
-        mode = ctl["mode"]
-
-        # ---- transitions (hysteresis between blocked and clear) ----
-        if mode == "unstick":
-            if not (ctl["unstick_until"] is not None and now < ctl["unstick_until"]):
-                # reverse finished: flip the latched pivot and go back to searching
-                ctl["unstick_until"] = None
-                ctl["pivot_dir"] = -ctl["pivot_dir"]
-                ctl["search_since"] = now
-                ctl["yaw_low_since"] = None
-                mode = "search"
-        elif mode == "search":
-            if clear:
-                mode = "run"
-                ctl["search_since"] = None
-                ctl["yaw_low_since"] = None
-            else:
-                stuck = (ctl["search_since"] is not None
-                         and (now - ctl["search_since"]) > CTL_STUCK_SEC)
-                yaw_stuck = False
-                if ARMED:
-                    if abs(yaw_rate) < CTL_YAW_MIN:
-                        if ctl["yaw_low_since"] is None:
-                            ctl["yaw_low_since"] = now
-                        yaw_stuck = (now - ctl["yaw_low_since"]) > CTL_YAW_STUCK_SEC
-                    else:
-                        ctl["yaw_low_since"] = None
-                if stuck or yaw_stuck:
-                    mode = "unstick"
-                    ctl["unstick_until"] = now + CTL_UNSTICK_SEC
-                    ctl["yaw_low_since"] = None
-        else:  # run
-            if blocked:
-                mode = "search"
-                ctl["search_since"] = now
-                # latch the pivot toward the side that currently looks more open
-                ctl["pivot_dir"] = 1 if centroid >= 0 else -1
-
-        ctl["mode"] = mode
-
-        # ---- act on the (possibly updated) mode ----
-        cause = None
-        if mode == "unstick":
-            turn_raw, thr_raw = 0.0, -CTL_REVERSE
-            reason = "unstick: backing off both motors"
-        elif mode == "search":
-            d = ctl["pivot_dir"]
-            turn_raw, thr_raw = CTL_SEARCH_TURN * d, 0.0
-            reason = "search: blocked, pivoting " + ("right" if d > 0 else "left")
-        else:  # run
-            turn_target = _clamp(CTL_TURN_GAIN * centroid)
-            comfort = (center >= CTL_COMFORT_PCT and spread < CTL_COMFORT_SPREAD)
-            if comfort:
-                turn_target = 0.0
-            # Turn hysteresis with a dwell floor: hold straight and only break into
-            # a turn when the opening is clearly off-center (ENTER); once turning,
-            # keep it until the opening recenters (EXIT). The dwell timer forbids
-            # flipping the decision more often than CTL_TURN_DWELL, so the latch
-            # cannot chatter frame-to-frame near the threshold at 16fps.
-            if (now - ctl["turn_t"]) >= CTL_TURN_DWELL:
-                if ctl["turning"]:
-                    if abs(turn_target) < CTL_TURN_EXIT:
-                        ctl["turning"] = False
-                        ctl["turn_t"] = now
-                elif abs(turn_target) > CTL_TURN_ENTER:
-                    ctl["turning"] = True
-                    ctl["turn_t"] = now
-            if ctl["turning"]:
-                turn_raw = turn_target
-                cause = "steer"
-            else:
-                turn_raw = 0.0
-                cause = "comfort" if comfort else "cruise"
-            reason = ""   # filled in after smoothing, from the commanded turn
-            # Throttle: full ahead when straight; back off with the turn so the
-            # boat pivots instead of arcing at speed into the wall it is avoiding.
-            thr_raw = max(CTL_MIN_THROTTLE,
-                          CTL_CRUISE * (1.0 - CTL_TURN_SLOWDOWN * abs(turn_raw)))
-
-        # ---- frame-rate independent smoothing (time constant), then tank mix ----
-        last_t = ctl["last_t"]
-        dt = (now - last_t) if last_t is not None else (1.0 / 16.0)
-        dt = min(max(dt, 0.005), 0.5)          # clamp first call and any stall
-        ctl["last_t"] = now
-        a_s = dt / (CTL_TURN_TAU + dt)          # EMA weight from dt and tau
-        turn = ctl["turn"] + a_s * (turn_raw - ctl["turn"])
-        throttle = ctl["throttle"] + a_s * (thr_raw - ctl["throttle"])
-        left = _clamp(throttle - turn)
-        right = _clamp(throttle + turn)
-        # Run reason reflects the smoothed command, not the raw decision, so the
-        # readout never says "straight" while the EMA is still easing out a turn.
-        if mode == "run":
-            settled = abs(turn) < CTL_DEADBAND
-            if cause == "comfort":
-                reason = "run: open and flat, " + ("straight" if settled else "easing straight")
-            elif cause == "cruise":
-                reason = "run: clear, full ahead" if settled else "run: easing straight, full ahead"
-            else:
-                reason = "run: steering toward opening"
-        ctl["turn"] = turn
-        ctl["throttle"] = throttle
-        ctl["left"] = left
-        ctl["right"] = right
-        ctl["reason"] = reason
-        return {"mode": mode, "turn": round(turn, 3), "throttle": round(throttle, 3),
-                "left": round(left, 3), "right": round(right, 3),
-                "reason": reason, "armed": ARMED}
-
-
-def camera_loop():
-    # NOTE: this opens the camera directly for monitoring. Once a real control
-    # loop owns the camera, only one process can hold the CSI device, so at that
-    # point the dashboard should read frames from the control loop instead of
-    # opening the camera itself.
-    try:
-        picam = Picamera2()
-        cfg = picam.create_video_configuration(
-            main={"size": (320, 240), "format": "RGB888"})
-        picam.configure(cfg)
-        picam.start()
-        time.sleep(0.5)
-    except Exception as e:
-        print(f"[camera] init failed: {e}")
-        return
-
-    count = 0
-    win = time.monotonic()
-    fps = 0.0
-    while True:
-        try:
-            frame = picam.capture_array()         # "RGB888" but actually BGR order
-        except Exception:
-            time.sleep(0.05)
-            continue
-
-        t0 = time.monotonic()
-        result = analyze(frame, is_rgb=False)
-        latency = (time.monotonic() - t0) * 1000.0
-
-        with alock:
-            yaw_rate = YAW_SIGN * att["gz"]          # rad/s, for the stuck check
-        cmd = control_step(result.zones, result.center_depth_pct,
-                           yaw_rate, time.monotonic())
-        # ACTUATION POINT. Dry-run: nothing drives the motors. To arm, set ARMED
-        # True (above) and drive the DRV8833 from cmd["left"]/cmd["right"] here,
-        # e.g. set_motors(cmd["left"], cmd["right"]). left/right are signed
-        # fractions in [-1, 1]; map magnitude to PWM duty and sign to direction.
-
-        vis = annotate(frame, result, is_rgb=False)  # frame is already BGR
-        with rlock:
-            raw_buf["frame"] = frame
-        ok, buf = cv2.imencode(".jpg", vis, [int(cv2.IMWRITE_JPEG_QUALITY), 80])
-        if ok:
-            with flock:
-                frame_buf["jpeg"] = buf.tobytes()
-
-        count += 1
-        now = time.monotonic()
-        if now - win >= 1.0:
-            fps = count / (now - win)
-            count = 0
-            win = now
-
-        with plock:
-            proc["fps"] = fps
-            proc["latency_ms"] = latency
-            proc["best_zone"] = int(result.best_zone)
-            proc["center_pct"] = float(result.center_depth_pct)
-            proc["zones"] = list(result.zones)
-            proc["cam_ok"] = True
-            proc["cmd"] = cmd
-
-        _maybe_capture(frame, result, fps, latency, cmd)
-
-
-# ---------- Capture / data-collection helpers ----------
-# Ordered telemetry columns. cmd_left/cmd_right are reserved for the autonomy
-# controller (blank until it exists) so a session's record already aligns the
-# boat's commanded output with what vision saw, frame for frame.
-TELEMETRY_COLUMNS = [
-    "t_iso", "t_unix", "frame",
-    "fps", "vision_ms",
-    "best_zone", "center_pct", "z0", "z1", "z2", "z3", "z4",
-    "roll_deg", "pitch_deg", "yaw_deg",
-    "ax", "ay", "az", "gx", "gy", "gz", "imu_hz",
-    "pack_v", "rail_v", "current_ma", "power_w",
-    "cpu_pct", "cpu_temp_c", "under_voltage", "throttled_now", "uv_occurred",
-    "gps_fix", "gps_valid", "gps_lat", "gps_lon", "gps_alt_m",
-    "gps_sats", "gps_hdop", "gps_sog_ms", "gps_cog",
-    "cmd_left", "cmd_right", "cmd_mode",
-]
-
-
-def _fmt(v, nd=None):
-    # CSV cell: blank for None, fixed-decimal for floats, str otherwise.
-    if v is None:
-        return ""
-    if nd is not None:
-        try:
-            return ("%%.%df" % nd) % v
-        except (TypeError, ValueError):
-            return ""
-    if isinstance(v, bool):
-        return "1" if v else "0"
-    return str(v)
-
-
-def _git_commit():
-    try:
-        out = subprocess.run(["git", "-C", "/home/ben/autoboat", "rev-parse", "--short", "HEAD"],
-                             capture_output=True, text=True, timeout=3)
-        return out.stdout.strip() or None
-    except Exception:
-        return None
-
-
-def _pi_model():
-    try:
-        with open("/proc/device-tree/model") as f:
-            return f.read().strip("\x00").strip()
-    except Exception:
-        return None
-
-
-def _pipeline_meta():
-    if _vp is None:
-        return {"available": False}
-    g = lambda k: getattr(_vp, k, None)
-    return {"available": True, "method": g("DEFAULT_METHOD"), "num_zones": g("NUM_ZONES"),
-            "roi_top_frac": g("ROI_TOP_FRAC"), "gap_tolerance": g("GAP_TOLERANCE"),
-            "bottom_skip_max": g("BOTTOM_SKIP_MAX"), "texture_window": g("TEXTURE_WINDOW"),
-            "vert_close": g("VERT_CLOSE"), "depth_smooth": g("DEPTH_SMOOTH"),
-            "connect_from_bottom": g("CONNECT_FROM_BOTTOM")}
-
-
-def _session_meta():
-    # Static run context: enough to reproduce and interpret the data offline.
-    with pwlock:
-        pwr_on = bool(power.get("connected"))
-    with glock:
-        gps_on = bool(gps.get("connected"))
-    with alock:
-        imu_on = bool(att.get("ok"))
-    return {
-        "schema_version": 2,
-        "host": {"hostname": (os.uname().nodename if hasattr(os, "uname") else None),
-                 "pi_model": _pi_model()},
-        "git_commit": _git_commit(),
-        "camera": {"resolution": "320x240",
-                   "note": "picamera2 RGB888 buffer is BGR-ordered; analyze/annotate use is_rgb=False",
-                   "lens": os.environ.get("AUTOBOAT_LENS", "unknown")},
-        "pipeline": _pipeline_meta(),
-        "imu": {"present": IMU_AVAILABLE, "alpha": ALPHA,
-                "roll_sign": ROLL_SIGN, "pitch_sign": PITCH_SIGN, "yaw_sign": YAW_SIGN,
-                "accel_units": "m/s^2", "gyro_units": "rad/s"},
-        "gps": {"present": GPS_AVAILABLE, "receiver": "VK-162 (u-blox 7)", "baud": GPS_BAUD,
-                "note": "consumer GPS ~2.5m CEP; not usable for pool-scale boundaries"},
-        "capture": {"interval_s": CAPTURE_INTERVAL, "min_free_mb": CAPTURE_MIN_FREE_MB,
-                    "jpeg_quality": 90, "data_root": DATA_ROOT},
-        "sensors_online_at_start": {"camera": CAMERA_AVAILABLE, "imu": imu_on,
-                                    "power": pwr_on, "gps": gps_on},
-        "controller": {"armed": ARMED, "turn_tau": CTL_TURN_TAU,
-                       "turn_dwell": CTL_TURN_DWELL, "deadband": CTL_DEADBAND,
-                       "blocked_pct": CTL_BLOCKED_PCT, "clear_pct": CTL_CLEAR_PCT,
-                       "comfort_pct": CTL_COMFORT_PCT, "comfort_spread": CTL_COMFORT_SPREAD,
-                       "turn_gain": CTL_TURN_GAIN, "turn_enter": CTL_TURN_ENTER,
-                       "turn_exit": CTL_TURN_EXIT, "cruise": CTL_CRUISE,
-                       "turn_slowdown": CTL_TURN_SLOWDOWN,
-                       "min_throttle": CTL_MIN_THROTTLE, "search_turn": CTL_SEARCH_TURN,
-                       "stuck_sec": CTL_STUCK_SEC, "reverse": CTL_REVERSE,
-                       "unstick_sec": CTL_UNSTICK_SEC},
-        "telemetry_columns": TELEMETRY_COLUMNS,
-    }
-
-
-def _cap_event(sdir, msg):
-    # Append a timestamped line to the session event log. Best effort.
-    if not sdir:
-        return
-    try:
-        with open(os.path.join(sdir, "events.log"), "a") as f:
-            f.write("%s  %s\n" % (time.strftime("%Y-%m-%dT%H:%M:%S"), msg))
-    except Exception:
-        pass
-
-
-def _write_manifest(sdir, meta):
-    if not sdir or meta is None:
-        return
-    try:
-        with open(os.path.join(sdir, "manifest.json"), "w") as f:
-            json.dump(meta, f, indent=2)
-    except Exception:
-        pass
-
-
-def _free_mb(path):
-    try:
-        return shutil.disk_usage(path).free / (1024.0 * 1024.0)
-    except Exception:
-        return None
-
-
-def _accumulate_hsv(frame_rgb):
-    # frame_rgb is actually BGR (picamera2 "RGB888" order). Sample the lower-center
-    # patch, most likely open water, and accumulate pixel-level HSV sums.
-    try:
-        h, w = frame_rgb.shape[:2]
-        patch = frame_rgb[int(h * 0.70):h, int(w * 0.35):int(w * 0.65)]
-        hsv = cv2.cvtColor(patch, cv2.COLOR_BGR2HSV).reshape(-1, 3).astype("float64")
-        s = hsv.sum(axis=0)
-        sq = (hsv * hsv).sum(axis=0)
-        _cap_hsv["n"] += hsv.shape[0]
-        _cap_hsv["h"] += s[0]; _cap_hsv["s"] += s[1]; _cap_hsv["v"] += s[2]
-        _cap_hsv["h2"] += sq[0]; _cap_hsv["s2"] += sq[1]; _cap_hsv["v2"] += sq[2]
-    except Exception:
-        pass
-
-
-def _hsv_calibration():
-    # OpenCV HSV: H 0-179, S/V 0-255. Suggests water-mask bounds as mean +/- 2 std.
-    # Assumes hue doesn't wrap (pool water sits near H 90-110, so it won't).
-    n = _cap_hsv["n"]
-    if n <= 0:
-        return None
-    out = {}
-    for ch in ("h", "s", "v"):
-        mean = _cap_hsv[ch] / n
-        var = max(_cap_hsv[ch + "2"] / n - mean * mean, 0.0)
-        out[ch] = {"mean": round(mean, 1), "std": round(var ** 0.5, 1)}
-    clamp = lambda x, m: int(max(0, min(m, round(x))))
-    lower = [clamp(out["h"]["mean"] - 2 * out["h"]["std"], 179),
-             clamp(out["s"]["mean"] - 2 * out["s"]["std"], 255),
-             clamp(out["v"]["mean"] - 2 * out["v"]["std"], 255)]
-    upper = [clamp(out["h"]["mean"] + 2 * out["h"]["std"], 179),
-             clamp(out["s"]["mean"] + 2 * out["s"]["std"], 255),
-             clamp(out["v"]["mean"] + 2 * out["v"]["std"], 255)]
-    return {"pixels_sampled": int(n), "hsv_lower": lower, "hsv_upper": upper,
-            "per_channel": out}
-
-
-def capture_start():
-    with caplock:
-        if cap["recording"]:
-            return {"ok": True, "message": "already recording",
-                    "session": os.path.basename(cap["session"]) if cap["session"] else None}
-        try:
-            os.makedirs(CAPTURE_ROOT, exist_ok=True)
-        except Exception as e:
-            return {"ok": False, "error": "cannot create %s: %s" % (CAPTURE_ROOT, e)}
-        free = _free_mb(CAPTURE_ROOT)
-        if free is not None and free < CAPTURE_MIN_FREE_MB:
-            return {"ok": False, "error": "only %.0f MB free, need %d" % (free, CAPTURE_MIN_FREE_MB)}
-        name = time.strftime("session_%Y%m%d_%H%M%S")
-        sdir = os.path.join(CAPTURE_ROOT, name)
-        try:
-            os.makedirs(os.path.join(sdir, "frames"), exist_ok=True)
-            fh = open(os.path.join(sdir, "telemetry.csv"), "w")
-            fh.write(",".join(TELEMETRY_COLUMNS) + "\n")
-            fh.flush()
-        except Exception as e:
-            return {"ok": False, "error": "cannot open session: %s" % e}
-        _cap_fh["f"] = fh
-        for k in _cap_hsv:
-            _cap_hsv[k] = 0 if k == "n" else 0.0
-        meta = _session_meta()
-        meta["session_id"] = name
-        meta["started_iso"] = time.strftime("%Y-%m-%dT%H:%M:%S")
-        meta["free_mb_at_start"] = round(free, 1) if free is not None else None
-        _cap_meta["d"] = meta
-        _write_manifest(sdir, meta)
-        _cap_event(sdir, "capture started (method=%s, lens=%s)" % (
-            (meta["pipeline"] or {}).get("method"), meta["camera"]["lens"]))
-        cap.update({"recording": True, "session": sdir, "started": time.monotonic(),
-                    "frames": 0, "last_save": 0.0, "free_mb": free, "error": None,
-                    "stop_reason": None})
-        return {"ok": True, "message": "recording", "session": name}
-
-
-def _finalize_session_locked(reason):
-    # caplock MUST be held. Closes the telemetry file, writes the HSV calibration
-    # and the finalized manifest, logs the stop event. Returns (frames, sdir, calib).
-    cap["recording"] = False
-    cap["stop_reason"] = reason
-    fh = _cap_fh["f"]
-    _cap_fh["f"] = None
-    sdir = cap["session"]
-    frames = cap["frames"]
-    started = cap["started"]
-    if fh:
-        try:
-            fh.flush(); fh.close()
-        except Exception:
-            pass
-    calib = _hsv_calibration() if frames >= CAPTURE_MIN_FRAMES else None
-    if sdir and calib:
-        try:
-            with open(os.path.join(sdir, "water_hsv.json"), "w") as cf:
-                json.dump(calib, cf, indent=2)
-        except Exception:
-            pass
-    meta = _cap_meta["d"]
-    if meta is not None:
-        free = _free_mb(sdir) if sdir else None
-        meta["stopped_iso"] = time.strftime("%Y-%m-%dT%H:%M:%S")
-        meta["duration_s"] = round(time.monotonic() - started, 1) if started else None
-        meta["frames_saved"] = frames
-        meta["stop_reason"] = reason
-        meta["free_mb_at_stop"] = round(free, 1) if free is not None else None
-        meta["water_hsv"] = calib
-        _write_manifest(sdir, meta)
-    _cap_event(sdir, "capture stopped (reason=%s, frames=%d)" % (reason, frames))
-    _cap_meta["d"] = None
-    if sdir:
-        cap["last_session"] = os.path.basename(sdir)
-        cap["last_frames"] = frames
-        cap["last_duration"] = round(time.monotonic() - started, 1) if started else 0.0
-    return frames, sdir, calib
-
-
-def capture_stop(reason="user"):
-    with caplock:
-        if not cap["recording"]:
-            return {"ok": True, "message": "not recording"}
-        frames, sdir, calib = _finalize_session_locked(reason)
-    return {"ok": True, "message": "stopped", "frames": frames,
-            "session": os.path.basename(sdir) if sdir else None,
-            "calibration": calib}
-
-
-# ---------- In-process control actions ----------
-# These run inside the dashboard rather than as shell commands. The /action/<name>
-# handler checks PY_ACTIONS before falling back to ALLOWED_ACTIONS shell commands.
-def _do_imu_zero():
-    if not IMU_AVAILABLE:
-        return {"ok": False, "error": "IMU offline"}
-    with alock:
-        imu_cmd["zero_yaw"] = True
-    return {"ok": True, "message": "heading zeroed"}
-
-
-def _do_snapshot():
-    with rlock:
-        frame = raw_buf["frame"]
-    if frame is None:
-        return {"ok": False, "error": "no camera frame yet"}
-    cap_dir = os.path.join(DATA_ROOT, "captures")
-    try:
-        os.makedirs(cap_dir, exist_ok=True)
-        fname = time.strftime("snap_%Y%m%d_%H%M%S.jpg")
-        # frame is BGR (picamera2 order), which is what imwrite expects.
-        cv2.imwrite(os.path.join(cap_dir, fname), frame,
-                    [int(cv2.IMWRITE_JPEG_QUALITY), 95])
-    except Exception as e:
-        return {"ok": False, "error": "save failed: %s" % e}
-    return {"ok": True, "message": "saved " + fname}
-
-
+# ---------- In-process actions ----------
+# Each action lives in the module that owns the machinery; this is just the
+# name -> function routing for POST /action/<name>.
 PY_ACTIONS = {
-    "imu_zero": _do_imu_zero,
-    "snapshot": _do_snapshot,
+    "start": pilot.start_run,
+    "stop": pilot.stop_run,
+    "arm": motors.arm,
+    "disarm": motors.disarm,
+    "cap_up": lambda: motors.cap_step(+0.1),
+    "cap_down": lambda: motors.cap_step(-0.1),
+    "trim_check": motors.trim_check,
+    "imu_zero": imu.zero_heading,
+    "snapshot": pilot.snapshot_still,
+    "critical_override": hwpower._critical_override,
 }
 
 
-def _maybe_capture(frame_rgb, result, fps, vision_ms, cmd=None):
-    # Called from camera_loop each frame; saves a still + a full telemetry row at
-    # the configured interval while recording. Does its own locking.
-    now = time.monotonic()
-    with caplock:
-        if not cap["recording"] or (now - cap["last_save"]) < CAPTURE_INTERVAL:
-            return
-        sdir = cap["session"]
-        fh = _cap_fh["f"]
-        n = cap["frames"]
-        with alock:
-            roll = math.degrees(att["roll"]); pitch = math.degrees(att["pitch"])
-            yaw = math.degrees(att["yaw"]); imu_hz = att["hz"]
-            ax = att["ax"]; ay = att["ay"]; az = att["az"]
-            gx = att["gx"]; gy = att["gy"]; gz = att["gz"]
-        with pwlock:
-            pack_v = power["pack_v"]; rail_v = power["rail_v"]
-            cur = power["current_ma"]; pwr_w = power["power_w"]
-        with slock:
-            cpu_pct = sysm.get("cpu_pct"); cpu_temp = sysm.get("temp_c")
-            uv = sysm.get("under_voltage"); thr = sysm.get("throttled_now")
-            uvo = sysm.get("uv_occurred")
-        with glock:
-            g_fix = gps["fix_type"]; g_valid = gps["valid"]
-            g_lat = gps["lat"]; g_lon = gps["lon"]; g_alt = gps["alt"]
-            g_sats = gps["sats_used"]; g_hdop = gps["hdop"]
-            g_sog = gps["sog_ms"]; g_cog = gps["cog"]
-        fname = "frame_%06d.jpg" % n
-        try:
-            # frame_rgb is already BGR (picamera2 order), which is what imwrite wants.
-            cv2.imwrite(os.path.join(sdir, "frames", fname), frame_rgb,
-                        [int(cv2.IMWRITE_JPEG_QUALITY), 90])
-        except Exception as e:
-            cap["error"] = "save failed: %s" % e
-            _cap_event(sdir, "frame save failed at #%d: %s" % (n, e))
-            return
-        z = list(result.zones)
-        if fh:
-            row = [
-                time.strftime("%Y-%m-%dT%H:%M:%S"), _fmt(time.time(), 3), fname,
-                _fmt(fps, 1), _fmt(vision_ms, 1),
-                _fmt(int(result.best_zone)), _fmt(float(result.center_depth_pct), 1),
-                _fmt(z[0]), _fmt(z[1]), _fmt(z[2]), _fmt(z[3]), _fmt(z[4]),
-                _fmt(roll, 1), _fmt(pitch, 1), _fmt(yaw, 1),
-                _fmt(ax, 3), _fmt(ay, 3), _fmt(az, 3),
-                _fmt(gx, 4), _fmt(gy, 4), _fmt(gz, 4), _fmt(imu_hz, 1),
-                _fmt(pack_v, 2), _fmt(rail_v, 2),
-                ("" if cur is None else _fmt(int(round(cur)))), _fmt(pwr_w, 2),
-                _fmt(cpu_pct, 1), _fmt(cpu_temp, 1), _fmt(uv), _fmt(thr), _fmt(uvo),
-                _fmt(g_fix), _fmt(g_valid), _fmt(g_lat, 6), _fmt(g_lon, 6), _fmt(g_alt, 1),
-                _fmt(g_sats), _fmt(g_hdop, 1), _fmt(g_sog, 2), _fmt(g_cog, 1),
-                (_fmt(int(round(cmd["left"] * 100))) if cmd else ""),
-                (_fmt(int(round(cmd["right"] * 100))) if cmd else ""),
-                (cmd["mode"] if cmd else ""),
-                # cmd_left, cmd_right (signed percent) and cmd_mode from the controller
-            ]
-            try:
-                fh.write(",".join(row) + "\n")
-                fh.flush()
-            except Exception:
-                pass
-        _accumulate_hsv(frame_rgb)
-        cap["frames"] = n + 1
-        cap["last_save"] = now
-        if (cap["frames"] % 20) == 0:
-            free = _free_mb(sdir)
-            cap["free_mb"] = free
-            if free is not None and free < CAPTURE_MIN_FREE_MB:
-                cap["error"] = "stopped: low card space (%.0f MB)" % free
-                _finalize_session_locked("low_space")
-
-
-# ---------- GPS / NMEA helpers ----------
-def _gps_find_port():
-    # VK-162 is a CDC-ACM device, so prefer ttyACM; fall back to ttyUSB.
-    cands = sorted(glob.glob("/dev/ttyACM*")) + sorted(glob.glob("/dev/ttyUSB*"))
-    return cands[0] if cands else None
-
-
-def _gps_checksum_ok(line):
-    if not line.startswith("$") or "*" not in line:
-        return False
-    star = line.rfind("*")
-    calc = 0
-    for ch in line[1:star]:
-        calc ^= ord(ch)
+def _index_page():
     try:
-        return calc == int(line[star + 1:star + 3], 16)
-    except ValueError:
-        return False
-
-
-def _to_deg(val, hemi):
-    if not val or not hemi or "." not in val:
-        return None
-    try:
-        dot = val.index(".")
-        deg = int(val[:dot - 2])
-        minutes = float(val[dot - 2:])
-        dec = deg + minutes / 60.0
-        return -dec if hemi in ("S", "W") else dec
-    except (ValueError, IndexError):
-        return None
-
-
-def _fmt_time(t):
-    return f"{t[0:2]}:{t[2:4]}:{t[4:6]}" if t and len(t) >= 6 else None
-
-
-def _fmt_date(d):
-    return f"{d[0:2]}-{d[2:4]}-20{d[4:6]}" if d and len(d) >= 6 else None
-
-
-def _gps_parse(line, st):
-    f = line[1:line.rfind("*")].split(",")
-    kind = f[0][-3:] if f and len(f[0]) >= 3 else ""
-    if kind == "GGA" and len(f) >= 10:
-        st["lat"] = _to_deg(f[2], f[3])
-        st["lon"] = _to_deg(f[4], f[5])
-        st["sats_used"] = int(f[7]) if f[7].isdigit() else None
-        st["hdop"] = float(f[8]) if f[8] else None
-        st["alt"] = float(f[9]) if f[9] else None
-        st["utc"] = _fmt_time(f[1]) or st.get("utc")
-    elif kind == "RMC" and len(f) >= 10:
-        st["valid"] = (f[2] == "A")
-        if f[2] == "A":
-            st["lat"] = _to_deg(f[3], f[4])
-            st["lon"] = _to_deg(f[5], f[6])
-        st["sog_ms"] = (float(f[7]) * 0.514444) if f[7] else None
-        st["cog"] = float(f[8]) if f[8] else None
-        st["utc"] = _fmt_time(f[1]) or st.get("utc")
-        st["date"] = _fmt_date(f[9])
-    elif kind == "GSA" and len(f) >= 18:
-        st["fix_type"] = {"1": "none", "2": "2D", "3": "3D"}.get(f[2], "?")
-    elif kind == "GSV" and len(f) >= 4:
-        if f[3].isdigit():
-            st["sats_view"] = int(f[3])
-    elif kind == "VTG" and len(f) >= 8:
-        if f[1]:
-            st["cog"] = float(f[1])
-        if f[5]:
-            st["sog_ms"] = float(f[5]) * 0.514444
-
-
-def gps_loop():
-    # Reconnecting reader: finds the port, streams NMEA into the shared `gps`
-    # dict, and on unplug/silence/error backs off and retries so the dashboard
-    # recovers on its own when the receiver comes back.
-    while True:
-        port = _gps_find_port()
-        if not port:
-            with glock:
-                gps["connected"] = False
-            time.sleep(3.0)
-            continue
-        try:
-            ser = serial.Serial(port, GPS_BAUD, timeout=1.0)
-        except Exception as e:
-            print(f"[gps] cannot open {port}: {e}")
-            with glock:
-                gps["connected"] = False
-            time.sleep(3.0)
-            continue
-
-        print(f"[gps] reading {port} @ {GPS_BAUD} 8N1")
-        work = {"fix_type": "none", "valid": False, "sats_used": None,
-                "sats_view": None, "lat": None, "lon": None, "alt": None,
-                "hdop": None, "sog_ms": None, "cog": None, "utc": None, "date": None}
-        last_data = time.monotonic()
-        try:
-            while True:
-                raw = ser.readline()
-                now = time.monotonic()
-                if raw:
-                    line = raw.decode("ascii", errors="replace").strip()
-                    if _gps_checksum_ok(line):
-                        try:
-                            _gps_parse(line, work)
-                        except Exception:
-                            pass  # skip a malformed-but-checksummed line
-                        last_data = now
-                        with glock:
-                            gps.update(work)
-                            gps["connected"] = True
-                            gps["last_data"] = now
-                elif now - last_data > 6.0:
-                    break  # port open but silent; drop and retry
-        except Exception as e:
-            print(f"[gps] read error: {e}")
-        finally:
-            try:
-                ser.close()
-            except Exception:
-                pass
-        with glock:
-            gps["connected"] = False
-        time.sleep(2.0)
-
-
-def _pack_status(v):
-    if v is None:
-        return "--"
-    if v >= PACK_LOW:
-        return "ok"
-    if v >= PACK_CRITICAL:
-        return "low"
-    return "critical"
-
-
-def _do_critical_shutdown():
-    # Finalize any recording first so we do not leave a half-written session
-    # (the brownout signature), then halt the Pi cleanly.
-    try:
-        with caplock:
-            recording = cap["recording"]
-        if recording:
-            capture_stop(reason="battery_critical")
-    except Exception:
-        pass
-    try:
-        subprocess.run(ALLOWED_ACTIONS["shutdown"], capture_output=True, text=True, timeout=10)
-    except Exception:
-        pass
-
-
-def _critical_tick(pack_v):
-    # Called from power_loop each read. Arms a countdown after the pack has been
-    # below critical for CRITICAL_DEBOUNCE, fires the shutdown at the deadline,
-    # and fully resets only once the pack recovers above CRITICAL_RECOVER.
-    if pack_v is None:
-        return
-    now = time.monotonic()
-    fire = False
-    with critlock:
-        snoozed = crit["snooze_until"] is not None and now < crit["snooze_until"]
-        if pack_v < PACK_CRITICAL:
-            if crit["below_since"] is None:
-                crit["below_since"] = now
-            sustained = (now - crit["below_since"]) >= CRITICAL_DEBOUNCE
-            if sustained and not snoozed and crit["deadline"] is None and not crit["fired"]:
-                crit["deadline"] = now + CRITICAL_GRACE
-            if crit["deadline"] is not None and not crit["fired"] and now >= crit["deadline"]:
-                crit["fired"] = True
-                fire = True
-        elif pack_v >= CRITICAL_RECOVER:
-            crit["below_since"] = None
-            crit["deadline"] = None
-            crit["snooze_until"] = None
-            crit["fired"] = False
-    if fire:
-        _do_critical_shutdown()
-
-
-def _critical_status():
-    now = time.monotonic()
-    with critlock:
-        if crit["fired"]:
-            return {"armed": True, "seconds_left": 0, "fired": True}
-        if crit["deadline"] is not None:
-            return {"armed": True, "fired": False,
-                    "seconds_left": max(0, int(round(crit["deadline"] - now)))}
-        snoozed = crit["snooze_until"] is not None and now < crit["snooze_until"]
-        return {"armed": False, "fired": False, "seconds_left": None,
-                "snoozed": snoozed,
-                "snooze_left": (int(round(crit["snooze_until"] - now)) if snoozed else None)}
-
-
-def _critical_override():
-    now = time.monotonic()
-    with critlock:
-        crit["deadline"] = None
-        crit["snooze_until"] = now + CRITICAL_SNOOZE
-    return {"ok": True, "message": "shutdown overridden; battery re-checked in %ds" % int(CRITICAL_SNOOZE)}
-
-
-PY_ACTIONS["critical_override"] = _critical_override
-
-
-def power_loop():
-    # Reconnecting reader for the high-side INA219. Pack voltage is bus + shunt
-    # (the sensor sits in the battery + lead). On any I2C error it backs off and
-    # retries so the dashboard recovers if the sensor drops off the bus.
-    while True:
-        try:
-            i2c3 = ExtendedI2C(INA_BUS)
-            ina = INA219(i2c3, addr=INA_ADDR)
-        except Exception as e:
-            print(f"[power] cannot open INA219 on /dev/i2c-{INA_BUS}: {e}")
-            with pwlock:
-                power["connected"] = False
-            time.sleep(3.0)
-            continue
-
-        print(f"[power] reading INA219 on /dev/i2c-{INA_BUS} at {hex(INA_ADDR)}")
-        try:
-            while True:
-                bus_v = ina.bus_voltage          # volts at Vin- (rail to loads)
-                shunt_v = ina.shunt_voltage       # volts across the shunt
-                pack_v = bus_v + shunt_v          # actual battery voltage
-                with pwlock:
-                    power["connected"] = True
-                    power["pack_v"] = round(pack_v, 3)
-                    power["rail_v"] = round(bus_v, 3)
-                    power["current_ma"] = round(ina.current, 1)
-                    power["power_w"] = round(ina.power, 3)
-                    power["status"] = _pack_status(pack_v)
-                    power["last_data"] = time.monotonic()
-                _critical_tick(pack_v)
-                time.sleep(0.5)
-        except Exception as e:
-            print(f"[power] read error: {e}")
-            with pwlock:
-                power["connected"] = False
-            time.sleep(2.0)
-
-
-def _cpu_sample():
-    with open("/proc/stat") as f:
-        vals = [int(x) for x in f.readline().split()[1:]]
-    idle = vals[3] + vals[4]          # idle + iowait
-    return sum(vals), idle
-
-
-def sys_loop():
-    prev_total, prev_idle = _cpu_sample()
-    while True:
-        time.sleep(1.0)
-        m = {}
-
-        try:
-            total, idle = _cpu_sample()
-            d_tot, d_idle = total - prev_total, idle - prev_idle
-            prev_total, prev_idle = total, idle
-            m["cpu_pct"] = round(100.0 * (1 - d_idle / d_tot), 1) if d_tot > 0 else 0.0
-        except Exception:
-            m["cpu_pct"] = None
-
-        try:
-            with open("/sys/class/thermal/thermal_zone0/temp") as f:
-                m["temp_c"] = round(int(f.read()) / 1000.0, 1)
-        except Exception:
-            m["temp_c"] = None
-
-        try:
-            with open("/proc/loadavg") as f:
-                m["load1"] = float(f.read().split()[0])
-        except Exception:
-            m["load1"] = None
-
-        try:
-            info = {}
-            with open("/proc/meminfo") as f:
-                for line in f:
-                    k, _, v = line.partition(":")
-                    info[k] = int(v.strip().split()[0])
-            tot = info["MemTotal"]
-            avail = info.get("MemAvailable", info["MemFree"])
-            used = tot - avail
-            m["mem_total_mb"] = round(tot / 1024)
-            m["mem_used_mb"] = round(used / 1024)
-            m["mem_pct"] = round(100.0 * used / tot, 1)
-        except Exception:
-            pass
-
-        try:
-            ssid = subprocess.run(["iwgetid", "-r"],
-                                  capture_output=True, text=True, timeout=2).stdout.strip()
-            m["ssid"] = ssid or None
-        except Exception:
-            m["ssid"] = None
-
-        try:
-            toks = subprocess.run(["hostname", "-I"],
-                                  capture_output=True, text=True, timeout=2).stdout.split()
-            m["ip"] = next((x for x in toks if ":" not in x), None)
-        except Exception:
-            m["ip"] = None
-
-        try:
-            with open("/proc/uptime") as f:
-                m["uptime_s"] = int(float(f.read().split()[0]))
-        except Exception:
-            m["uptime_s"] = None
-
-        try:
-            du = shutil.disk_usage("/")
-            m["disk_pct"] = round(100.0 * du.used / du.total, 1)
-        except Exception:
-            pass
-
-        try:
-            with open("/proc/net/wireless") as f:
-                for line in f.readlines()[2:]:
-                    if ":" in line:
-                        lvl = float(line.split()[3].rstrip("."))
-                        m["wifi_dbm"] = round(lvl)
-                        m["wifi_pct"] = max(0, min(100, round(2 * (lvl + 100))))
-                        break
-        except Exception:
-            pass
-
-        try:
-            out = subprocess.run(["vcgencmd", "get_throttled"],
-                                 capture_output=True, text=True, timeout=2).stdout
-            val = int(out.strip().split("=")[1], 16)
-            m["under_voltage"] = bool(val & 0x1)
-            m["throttled_now"] = bool(val & 0x4)
-            m["uv_occurred"] = bool(val & 0x10000)
-        except Exception:
-            pass
-
-        with slock:
-            sysm.clear()
-            sysm.update(m)
-
-
-# ---------- Past-run analysis helpers ----------
-# Read-only access to recorded sessions for the Analyze tab. Session names are
-# strictly validated to keep the frame/file routes from escaping CAPTURE_ROOT.
-_SESSION_RE = re.compile(r"^session_[0-9_]+$")
-
-
-def _safe_session_dir(name):
-    if not name or not _SESSION_RE.match(name):
-        return None
-    d = os.path.join(CAPTURE_ROOT, name)
-    return d if os.path.isdir(d) else None
-
-
-def _read_json_file(path):
-    try:
-        with open(path) as f:
-            return json.load(f)
-    except Exception:
-        return None
-
-
-def _read_text_file(path, limit=200000):
-    try:
-        with open(path) as f:
-            return f.read(limit)
-    except Exception:
-        return None
-
-
-def _read_telemetry(sdir):
-    # Returns (columns, rows). rows is a list of lists of raw string cells.
-    try:
-        with open(os.path.join(sdir, "telemetry.csv")) as f:
-            lines = f.read().splitlines()
-    except Exception:
-        return None, None
-    if not lines:
-        return [], []
-    return lines[0].split(","), [ln.split(",") for ln in lines[1:] if ln]
-
-
-def _list_sessions():
-    try:
-        names = [n for n in os.listdir(CAPTURE_ROOT) if _SESSION_RE.match(n)]
-    except Exception:
-        names = []
-    out = []
-    for name in sorted(names, reverse=True):
-        sdir = os.path.join(CAPTURE_ROOT, name)
-        man = _read_json_file(os.path.join(sdir, "manifest.json")) or {}
-        frames = man.get("frames_saved")
-        if frames is None:
-            try:
-                frames = sum(1 for f in os.listdir(os.path.join(sdir, "frames"))
-                             if f.endswith(".jpg"))
-            except Exception:
-                frames = 0
-        out.append({
-            "name": name, "frames": frames,
-            "duration": man.get("duration_s"), "started": man.get("started_iso"),
-            "method": (man.get("pipeline") or {}).get("method"),
-            "lens": (man.get("camera") or {}).get("lens"),
-            "stop_reason": man.get("stop_reason"),
-        })
-    return out
-
-
-def _gps_points(cols, rows):
-    if not cols or "gps_lat" not in cols or "gps_lon" not in cols:
-        return []
-    la, lo = cols.index("gps_lat"), cols.index("gps_lon")
-    fx = cols.index("gps_fix") if "gps_fix" in cols else None
-    sg = cols.index("gps_sog_ms") if "gps_sog_ms" in cols else None
-    pts = []
-    for i, r in enumerate(rows):
-        if len(r) <= max(la, lo) or not r[la] or not r[lo]:
-            continue
-        try:
-            lat, lon = float(r[la]), float(r[lo])
-        except ValueError:
-            continue
-        pts.append({"i": i, "lat": lat, "lon": lon,
-                    "fix": r[fx] if fx is not None and len(r) > fx else None,
-                    "sog": r[sg] if sg is not None and len(r) > sg else None})
-    return pts
-
-
-PAGE = b"""<!DOCTYPE html>
-<html lang="en">
-<head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title>AutoBoat</title>
-<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"/>
-<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
-<style>
-  body { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; margin: 0; padding: 18px;
-         background: #06090c; color: #c7d2da; }
-  h1 { font-size: 14px; font-weight: 500; letter-spacing: 1px; text-transform: uppercase;
-       color: #7d96a3; margin: 0 0 16px; }
-  h2 { font-size: 12px; font-weight: 500; letter-spacing: 1px; text-transform: uppercase;
-       color: #6b8794; margin: 24px 0 12px; }
-  .metrics { display: grid; grid-template-columns: repeat(auto-fit, minmax(118px, 1fr));
-             gap: 10px; }
-  .card { background: #0c1014; border: 1px solid #1b2530; border-radius: 8px; padding: 10px 12px; }
-  .card .k { font-size: 11px; color: #6b8794; letter-spacing: 0.5px; margin-bottom: 6px; }
-  .card .v { font-size: 18px; color: #e6eef2; }
-  .card .v small { font-size: 12px; color: #7d96a3; }
-  .status { margin-top: 12px; padding: 10px 14px; border-radius: 8px; font-size: 13px;
-            letter-spacing: 0.5px; border: 1px solid #1b2530; background: #0c1014; }
-  .row { display: flex; gap: 16px; flex-wrap: wrap; }
-  .panel { flex: 1; min-width: 300px; background: #0c1014; border: 1px solid #1b2530;
-           border-radius: 10px; padding: 12px; }
-  .label { font-size: 12px; color: #6b8794; margin-bottom: 8px; letter-spacing: 0.5px; }
-  canvas { width: 100%; height: auto; display: block; }
-  #cam { width: 100%; height: auto; display: block; border-radius: 6px; background: #06090c; }
-  #g_map { width: 100%; height: 320px; border: 0; border-radius: 8px; margin-top: 12px;
-           display: none; background: #0c1014; }
-  .readout { margin-top: 14px; font-size: 16px; letter-spacing: 1px; }
-  .readout span { color: #e6eef2; }
-  .drift { color: #d98a3a; }
-  .stale { color: #d9534f; }
-  .btn-row { display: flex; gap: 10px; flex-wrap: wrap; }
-  .btn { font-family: inherit; font-size: 13px; letter-spacing: 0.5px; color: #c7d2da;
-         background: #11181f; border: 1px solid #2a3742; border-radius: 8px;
-         padding: 10px 16px; cursor: pointer; transition: background .15s, border-color .15s; }
-  .btn:hover { background: #16212b; border-color: #3a4a57; }
-  .btn.danger { border-color: #5a2b2b; color: #e0a0a0; }
-  .btn.danger:hover { background: #2a1414; }
-  .btn.armed { background: #7a1f1f; border-color: #d9534f; color: #fff; }
-  .ctrl-status { margin-top: 12px; font-size: 12px; color: #7d96a3; letter-spacing: 0.5px;
-                 min-height: 14px; }
-  .tabbar { display: flex; align-items: center; gap: 2px; border-bottom: 1px solid #1b2530;
-            margin-bottom: 18px; }
-  .tabbar .brand { font-size: 14px; font-weight: 500; letter-spacing: 1px; text-transform: uppercase;
-                   color: #7d96a3; margin-right: 18px; }
-  .tab { font-family: inherit; font-size: 12px; letter-spacing: 1px; text-transform: uppercase;
-         color: #6b8794; background: transparent; border: 0; border-bottom: 2px solid transparent;
-         padding: 10px 14px; cursor: pointer; }
-  .tab:hover { color: #c7d2da; }
-  .tab.active { color: #3fd0a8; border-bottom-color: #3fd0a8; }
-  select { font-family: inherit; font-size: 13px; color: #c7d2da; background: #11181f;
-           border: 1px solid #2a3742; border-radius: 8px; padding: 9px 12px; }
-  .achart { width: 100%; height: 120px; display: block; }
-  .amap { width: 100%; height: 340px; border: 1px solid #1b2530; border-radius: 8px;
-          background: #0c1014; }
-  .aframe { width: 100%; border-radius: 6px; background: #06090c; display: block; }
-  .muted { color: #6b8794; font-size: 12px; letter-spacing: 0.3px; }
-  .kv { display: grid; grid-template-columns: max-content 1fr; gap: 5px 14px; font-size: 12px; }
-  .kv div:nth-child(odd) { color: #6b8794; }
-  pre.events { white-space: pre-wrap; font-size: 12px; color: #9fb2bd; background: #0c1014;
-               border: 1px solid #1b2530; border-radius: 8px; padding: 10px 12px;
-               max-height: 220px; overflow: auto; }
-</style>
-</head>
-<body>
-<div id="crit_overlay" style="display:none; position:fixed; inset:0; z-index:9999;
-     background:rgba(45,5,5,0.94); align-items:center; justify-content:center; text-align:center;">
-  <div style="max-width:540px; padding:30px;">
-    <div style="font-size:34px; font-weight:700; color:#ff5a5a; letter-spacing:1px;">BATTERY CRITICAL</div>
-    <div style="margin:16px 0 24px; color:#f0d2d2; font-size:16px;">
-      Shutting down in <span id="crit_secs">--</span>s to protect the pack and avoid SD corruption.</div>
-    <button id="crit_override" style="font-size:16px; padding:12px 22px; cursor:pointer;">Override (delay 2 min)</button>
-    <div id="crit_note" style="margin-top:12px; color:#c9a3a3; font-size:13px;"></div>
-  </div>
-</div>
-<div class="tabbar">
-  <span class="brand">AutoBoat</span>
-  <button class="tab active" data-tab="live" onclick="showTab('live')">Live</button>
-  <button class="tab" data-tab="analyze" onclick="showTab('analyze')">Analyze runs</button>
-</div>
-<div id="tab-live">
-<div class="metrics">
-  <div class="card"><div class="k">IMU RATE</div><div class="v" id="m_hz">--</div></div>
-  <div class="card"><div class="k">CPU TEMP</div><div class="v" id="m_temp">--</div></div>
-  <div class="card"><div class="k">CPU LOAD</div><div class="v" id="m_cpu">--</div></div>
-  <div class="card"><div class="k">MEMORY</div><div class="v" id="m_mem">--</div></div>
-  <div class="card"><div class="k">DISK</div><div class="v" id="m_disk">--</div></div>
-  <div class="card"><div class="k">UPTIME</div><div class="v" id="m_up">--</div></div>
-  <div class="card"><div class="k">SSID</div><div class="v" id="m_ssid">--</div></div>
-  <div class="card"><div class="k">WIFI</div><div class="v" id="m_wifi">--</div></div>
-  <div class="card"><div class="k">IP</div><div class="v" id="m_ip">--</div></div>
-</div>
-<div class="metrics" style="grid-template-columns: repeat(4, minmax(0, 1fr));">
-  <div class="card"><div class="k">PACK</div><div class="v" id="pw_pack">--</div></div>
-  <div class="card"><div class="k">CURRENT</div><div class="v" id="pw_cur">--</div></div>
-  <div class="card"><div class="k">POWER</div><div class="v" id="pw_w">--</div></div>
-  <div class="card"><div class="k">RAIL</div><div class="v" id="pw_rail">--</div></div>
-</div>
-<div class="status" id="m_power">power: --</div>
-<div class="ctrl-status" id="pw_status">pack --</div>
-
-<h2>Capture</h2>
-<div class="panel">
-  <div class="btn-row">
-    <button class="btn" id="cap_btn">Start capture</button>
-  </div>
-  <div class="ctrl-status" id="cap_status">idle</div>
-</div>
-
-<h2>Camera &amp; Vision</h2>
-<div class="row">
-  <div class="panel">
-    <div class="label">LIVE VIEW &mdash; water boundary, zones, steering pick</div>
-    <img id="cam" alt="waiting for camera...">
-  </div>
-  <div class="panel" style="max-width: 300px;">
-    <div class="label">PROCESSING</div>
-    <div class="metrics" style="grid-template-columns: repeat(2, 1fr);">
-      <div class="card"><div class="k">PIPELINE</div><div class="v" id="p_fps">--</div></div>
-      <div class="card"><div class="k">LATENCY</div><div class="v" id="p_lat">--</div></div>
-      <div class="card"><div class="k">BEST ZONE</div><div class="v" id="p_zone">--</div></div>
-      <div class="card"><div class="k">CENTER WATER</div><div class="v" id="p_center">--</div></div>
-    </div>
-  </div>
-</div>
-
-<h2>Decision <small style="color:#7d96a3">(dry-run, motors disarmed)</small></h2>
-<div class="panel">
-  <div class="metrics" style="grid-template-columns: repeat(auto-fit, minmax(100px, 1fr));">
-    <div class="card"><div class="k">MODE</div><div class="v" id="c_mode">--</div></div>
-    <div class="card"><div class="k">THROTTLE</div><div class="v" id="c_thr">--</div></div>
-    <div class="card"><div class="k">TURN</div><div class="v" id="c_turn">--</div></div>
-    <div class="card"><div class="k">LEFT</div><div class="v" id="c_left">--</div></div>
-    <div class="card"><div class="k">RIGHT</div><div class="v" id="c_right">--</div></div>
-  </div>
-  <div class="ctrl-status" id="c_reason">disarmed</div>
-</div>
-
-<h2>GPS</h2>
-<div class="panel">
-  <div class="metrics" style="grid-template-columns: repeat(auto-fit, minmax(108px, 1fr));">
-    <div class="card"><div class="k">FIX</div><div class="v" id="g_fix">--</div></div>
-    <div class="card"><div class="k">SATS</div><div class="v" id="g_sats">--</div></div>
-    <div class="card"><div class="k">HDOP</div><div class="v" id="g_hdop">--</div></div>
-    <div class="card"><div class="k">SPEED</div><div class="v" id="g_speed">--</div></div>
-    <div class="card"><div class="k">COURSE</div><div class="v" id="g_course">--</div></div>
-  </div>
-  <div class="ctrl-status" id="g_pos">position --</div>
-  <iframe id="g_map" title="GPS location" loading="lazy"
-          referrerpolicy="no-referrer-when-downgrade"></iframe>
-</div>
-
-<h2>Attitude</h2>
-<div class="row">
-  <div class="panel"><div class="label">ROLL &mdash; bow-on, heel off vertical</div><canvas id="cRoll" width="380" height="280"></canvas></div>
-  <div class="panel"><div class="label">PITCH &mdash; side, trim off horizontal</div><canvas id="cPitch" width="380" height="280"></canvas></div>
-</div>
-<div class="readout" id="readout">connecting...</div>
-
-<h2>Controls</h2>
-<div class="panel">
-  <div class="btn-row" id="ctrl_buttons"></div>
-  <div class="ctrl-status" id="ctrl_status"></div>
-</div>
-</div><!-- /tab-live -->
-
-<div id="tab-analyze" style="display:none">
-  <h2>Analyze past runs</h2>
-  <div class="panel">
-    <div class="label">SESSION</div>
-    <div class="btn-row" style="align-items:center">
-      <select id="an_sel"><option value="">loading...</option></select>
-      <button class="btn" id="an_refresh">Refresh</button>
-      <span class="muted" id="an_meta"></span>
-    </div>
-  </div>
-
-  <div id="an_body" style="display:none">
-    <h2>Summary</h2>
-    <div class="metrics" id="an_summary"></div>
-
-    <h2>Frame</h2>
-    <div class="row">
-      <div class="panel">
-        <img class="aframe" id="an_img" alt="frame">
-        <input type="range" id="an_slider" min="0" max="0" value="0" style="margin-top:10px; width:100%">
-        <div class="ctrl-status" id="an_frameinfo"></div>
-        <div class="btn-row" style="margin-top:10px; align-items:center">
-          <span class="muted">view</span>
-          <select id="an_view"><option value="raw">raw</option><option value="proc">processed</option></select>
-          <span class="muted">method</span>
-          <select id="an_method"><option value="texture">texture</option><option value="color">color</option></select>
-          <button class="btn" id="an_reanalyze">Re-analyze run</button>
-        </div>
-        <div class="ctrl-status" id="an_compare"></div>
-      </div>
-      <div class="panel" style="max-width:320px">
-        <div class="label">TELEMETRY AT FRAME</div>
-        <div class="kv" id="an_kv"></div>
-      </div>
-    </div>
-
-    <h2>Telemetry</h2>
-    <div class="panel">
-      <div class="label">CENTER WATER % &mdash; open water ahead</div>
-      <canvas class="achart" id="an_c_center"></canvas>
-      <div class="label" style="margin-top:14px">PACK VOLTAGE (V)</div>
-      <canvas class="achart" id="an_c_power"></canvas>
-      <div class="label" style="margin-top:14px">ROLL / PITCH (deg)</div>
-      <canvas class="achart" id="an_c_att"></canvas>
-      <div class="label" style="margin-top:14px">MOTOR COMMANDS % &mdash; left (green), right (blue), turn (amber). Dry-run.</div>
-      <canvas class="achart" id="an_c_motor"></canvas>
-    </div>
-
-    <h2>GPS track</h2>
-    <div class="panel">
-      <div class="muted" id="an_gps_note" style="margin-bottom:10px"></div>
-      <div id="an_map" class="amap"></div>
-    </div>
-
-    <h2>Events</h2>
-    <pre class="events" id="an_events">--</pre>
-  </div>
-</div><!-- /tab-analyze -->
-<script>
-// ---- Tabs + past-run analysis ----
-let _anLoaded=false, _anData=null, _anMap=null, _anTrack=[], _anIdx=0;
-function showTab(name){
-  document.getElementById('tab-live').style.display = (name==='live')?'':'none';
-  document.getElementById('tab-analyze').style.display = (name==='analyze')?'':'none';
-  document.querySelectorAll('.tab').forEach(function(t){
-    t.classList.toggle('active', t.getAttribute('data-tab')===name);
-  });
-  if(name==='analyze'){
-    if(!_anLoaded){ _anLoaded=true; anLoadSessions(); }
-    if(_anMap){ setTimeout(function(){ _anMap.invalidateSize(); }, 60); }
-  }
-}
-function _col(n){ return _anData? _anData.cols.indexOf(n) : -1; }
-async function anLoadSessions(){
-  const sel=document.getElementById('an_sel');
-  try{
-    const list=await (await fetch('/sessions',{cache:'no-store'})).json();
-    if(!list.length){ sel.innerHTML='<option value="">no sessions found</option>'; return; }
-    sel.innerHTML=list.map(function(s){
-      const dur=(s.duration!=null)? Math.round(s.duration)+'s':'?';
-      return '<option value="'+s.name+'">'+s.name+'  ('+(s.frames||0)+'f, '+dur+')</option>';
-    }).join('');
-    anSelect(sel.value);
-  }catch(e){ sel.innerHTML='<option value="">failed to load</option>'; }
-}
-async function anSelect(name){
-  if(!name) return;
-  document.getElementById('an_meta').textContent='loading...';
-  try{
-    const man=await fetch('/session/'+name+'/manifest',{cache:'no-store'}).then(r=>r.json()).catch(()=>({}));
-    const tel=await fetch('/session/'+name+'/telemetry',{cache:'no-store'}).then(r=>r.json()).catch(()=>({columns:[],rows:[]}));
-    const ev=await fetch('/session/'+name+'/events',{cache:'no-store'}).then(r=>r.text()).catch(()=>'');
-    _anData={ name:name, man:man||{}, cols:tel.columns||[], rows:tel.rows||[], series:null, reCenter:null };
-    const mm=(man&&man.pipeline&&man.pipeline.method)||'texture';
-    const msel=document.getElementById('an_method'); if(mm==='texture'||mm==='color') msel.value=mm;
-    document.getElementById('an_view').value='raw';
-    document.getElementById('an_compare').textContent='';
-    document.getElementById('an_body').style.display='';
-    anBuildSeries(); anRenderSummary(); anSetupFrames(); anRenderEvents(ev); anRenderMap();
-    document.getElementById('an_meta').textContent='';
-  }catch(e){ document.getElementById('an_meta').textContent='failed: '+e.message; }
-}
-function anBuildSeries(){
-  const rows=_anData.rows;
-  function ser(n){ const i=_anData.cols.indexOf(n); const out=[]; if(i<0) return out;
-    for(let k=0;k<rows.length;k++){ const v=parseFloat(rows[k][i]); if(!isNaN(v)) out.push({x:k,y:v}); } return out; }
-  // turn is the steering component, reconstructed from the tank-mixed motor pair:
-  // left = throttle - turn, right = throttle + turn  =>  turn = (right - left) / 2
-  const li=_anData.cols.indexOf('cmd_left'), ri=_anData.cols.indexOf('cmd_right');
-  const turn=[]; if(li>=0&&ri>=0){ for(let k=0;k<rows.length;k++){
-    const l=parseFloat(rows[k][li]), r=parseFloat(rows[k][ri]);
-    if(!isNaN(l)&&!isNaN(r)) turn.push({x:k,y:(r-l)/2}); } }
-  _anData.series={ center:ser('center_pct'), pack:ser('pack_v'), roll:ser('roll_deg'),
-                   pitch:ser('pitch_deg'), mleft:ser('cmd_left'), mright:ser('cmd_right'), turn:turn };
-}
-function anRenderSummary(){
-  const m=_anData.man||{}, rows=_anData.rows;
-  function stat(n,f){ const i=_anData.cols.indexOf(n); if(i<0) return null;
-    const xs=[]; for(const r of rows){ const v=parseFloat(r[i]); if(!isNaN(v)) xs.push(v); }
-    return xs.length? f(xs):null; }
-  const avgC=stat('center_pct',xs=>xs.reduce((a,b)=>a+b,0)/xs.length);
-  const minP=stat('pack_v',xs=>Math.min.apply(null,xs));
-  const maxI=stat('current_ma',xs=>Math.max.apply(null,xs));
-  const maxT=stat('cpu_temp_c',xs=>Math.max.apply(null,xs));
-  const uvI=_anData.cols.indexOf('under_voltage'); let uv=0;
-  if(uvI>=0) for(const r of rows){ if(r[uvI]==='1') uv++; }
-  const cards=[
-    ['FRAMES', rows.length],
-    ['DURATION', m.duration_s!=null? Math.round(m.duration_s)+' s':'?'],
-    ['METHOD', (m.pipeline||{}).method||'?'],
-    ['LENS', (m.camera||{}).lens||'?'],
-    ['AVG CENTER', avgC!=null? avgC.toFixed(0)+' %':'--'],
-    ['MIN PACK', minP!=null? minP.toFixed(2)+' V':'--'],
-    ['MAX CURRENT', maxI!=null? Math.round(maxI)+' mA':'--'],
-    ['MAX CPU', maxT!=null? maxT.toFixed(0)+' &deg;C':'--'],
-    ['UNDERVOLT ROWS', uv],
-    ['STOP', m.stop_reason||'?']
-  ];
-  document.getElementById('an_summary').innerHTML=cards.map(function(c){
-    return '<div class="card"><div class="k">'+c[0]+'</div><div class="v">'+c[1]+'</div></div>';
-  }).join('');
-}
-function drawChart(canvas, series, opts){
-  opts=opts||{};
-  const dpr=window.devicePixelRatio||1, w=canvas.clientWidth, h=canvas.clientHeight;
-  canvas.width=w*dpr; canvas.height=h*dpr;
-  const ctx=canvas.getContext('2d'); ctx.scale(dpr,dpr); ctx.clearRect(0,0,w,h);
-  let xmin=Infinity,xmax=-Infinity,ymin=(opts.ymin!=null?opts.ymin:Infinity),ymax=(opts.ymax!=null?opts.ymax:-Infinity);
-  series.forEach(s=>s.data.forEach(p=>{ if(p.x<xmin)xmin=p.x; if(p.x>xmax)xmax=p.x; }));
-  if(opts.ymin==null||opts.ymax==null) series.forEach(s=>s.data.forEach(p=>{ if(p.y<ymin)ymin=p.y; if(p.y>ymax)ymax=p.y; }));
-  ctx.font='10px monospace';
-  if(!isFinite(xmin)){ ctx.fillStyle='#6b8794'; ctx.fillText('no data',8,18); return; }
-  if(ymin===ymax){ ymax=ymin+1; }
-  const padL=30, padB=16;
-  function X(x){ return padL + (x-xmin)/((xmax-xmin)||1)*(w-padL-6); }
-  function Y(y){ return (h-padB) - (y-ymin)/((ymax-ymin)||1)*(h-padB-6); }
-  ctx.strokeStyle='#1b2530'; ctx.lineWidth=1;
-  ctx.beginPath(); ctx.moveTo(padL,4); ctx.lineTo(padL,h-padB); ctx.lineTo(w-6,h-padB); ctx.stroke();
-  ctx.fillStyle='#6b8794'; ctx.fillText(ymax.toFixed(1),2,11); ctx.fillText(ymin.toFixed(1),2,h-padB);
-  series.forEach(function(s){ ctx.strokeStyle=s.color; ctx.lineWidth=1.4; ctx.beginPath();
-    let started=false; s.data.forEach(function(p){ const px=X(p.x),py=Y(p.y);
-      if(!started){ ctx.moveTo(px,py); started=true; } else ctx.lineTo(px,py); }); ctx.stroke(); });
-  if(opts.cursorX!=null){ const cx=X(opts.cursorX); ctx.strokeStyle='#d9b13a'; ctx.lineWidth=1;
-    ctx.beginPath(); ctx.moveTo(cx,4); ctx.lineTo(cx,h-padB); ctx.stroke(); }
-}
-function anRenderCharts(cursor){
-  if(!_anData.series) anBuildSeries();
-  const s=_anData.series;
-  const centerSeries=[{data:s.center,color:'#3fd0a8'}];
-  if(_anData.reCenter){
-    const re=[]; for(let k=0;k<_anData.reCenter.length;k++){ const v=_anData.reCenter[k]; if(v!=null) re.push({x:k,y:v}); }
-    centerSeries.push({data:re,color:'#d9b13a'});
-  }
-  drawChart(document.getElementById('an_c_center'),centerSeries,{ymin:0,ymax:100,cursorX:cursor});
-  drawChart(document.getElementById('an_c_power'),[{data:s.pack,color:'#d9b13a'}],{cursorX:cursor});
-  drawChart(document.getElementById('an_c_att'),[{data:s.roll,color:'#3fd0a8'},{data:s.pitch,color:'#5aa9e6'}],{cursorX:cursor});
-  drawChart(document.getElementById('an_c_motor'),
-            [{data:s.mleft,color:'#3fd0a8'},{data:s.mright,color:'#5aa9e6'},{data:s.turn,color:'#d9b13a'}],
-            {ymin:-100,ymax:100,cursorX:cursor});
-}
-function anSetupFrames(){
-  const slider=document.getElementById('an_slider'), n=_anData.rows.length;
-  slider.max=Math.max(0,n-1); slider.value=0;
-  slider.oninput=function(){ anShowFrame(parseInt(slider.value,10)); };
-  if(n>0) anShowFrame(0); else { document.getElementById('an_frameinfo').textContent='no frames'; }
-}
-function anShowFrame(idx){
-  const rows=_anData.rows; if(idx<0||idx>=rows.length) return;
-  _anIdx=idx;
-  const r=rows[idx];
-  const view=document.getElementById('an_view').value;
-  const method=document.getElementById('an_method').value;
-  const img=document.getElementById('an_img');
-  if(view==='proc'){ img.src='/session/'+_anData.name+'/analyze/'+idx+'?method='+method; }
-  else { img.src='/session/'+_anData.name+'/frame/'+idx; }
-  document.getElementById('an_frameinfo').textContent='frame '+idx+' / '+(rows.length-1)+
-    (view==='proc'? '  (processed: '+method+')':'');
-  const fields=[['center_pct','center %'],['best_zone','best zone'],
-    ['z0','z0'],['z1','z1'],['z2','z2'],['z3','z3'],['z4','z4'],
-    ['roll_deg','roll'],['pitch_deg','pitch'],['yaw_deg','yaw'],
-    ['pack_v','pack V'],['current_ma','current mA'],['cpu_temp_c','cpu C'],['under_voltage','undervolt'],
-    ['cmd_mode','mode'],['cmd_left','L %'],['cmd_right','R %']];
-  document.getElementById('an_kv').innerHTML=fields.map(function(f){
-    const i=_anData.cols.indexOf(f[0]); const v=(i>=0&&i<r.length&&r[i]!=='')? r[i]:'--';
-    return '<div>'+f[1]+'</div><div>'+v+'</div>'; }).join('');
-  anRenderCharts(idx);
-}
-function anRenderEvents(txt){
-  document.getElementById('an_events').textContent=(txt&&txt.trim())? txt:'no events logged';
-}
-async function anRenderMap(){
-  const note=document.getElementById('an_gps_note'), mapdiv=document.getElementById('an_map');
-  let pts=[];
-  try{ pts=(await (await fetch('/session/'+_anData.name+'/gps',{cache:'no-store'})).json()).points||[]; }catch(e){}
-  if(!pts.length){ note.textContent='No GPS fixes in this run.'; mapdiv.style.display='none'; return; }
-  mapdiv.style.display='';
-  note.textContent=pts.length+' fixes. At pool scale GPS error (~2.5 m) exceeds the pool, so this track is mostly noise; it is meaningful only on open water.';
-  if(typeof L==='undefined'){ note.textContent+=' (map needs internet to load tiles)'; return; }
-  if(!_anMap){ _anMap=L.map('an_map',{maxZoom:22});
-    L.tileLayer('https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}',
-      {maxZoom:22, maxNativeZoom:19, attribution:'Esri World Imagery'}).addTo(_anMap); }
-  _anTrack.forEach(function(l){ _anMap.removeLayer(l); }); _anTrack=[];
-  const ll=pts.map(function(p){ return [p.lat,p.lon]; });
-  const line=L.polyline(ll,{color:'#3fd0a8',weight:3}); line.addTo(_anMap); _anTrack.push(line);
-  const a=L.circleMarker(ll[0],{radius:6,color:'#3fd0a8'}); a.addTo(_anMap); _anTrack.push(a);
-  const b=L.circleMarker(ll[ll.length-1],{radius:6,color:'#d9534f'}); b.addTo(_anMap); _anTrack.push(b);
-  _anMap.fitBounds(line.getBounds(),{padding:[20,20], maxZoom:21});
-  setTimeout(function(){ _anMap.invalidateSize(); },60);
-}
-document.getElementById('an_sel').onchange=function(){ anSelect(this.value); };
-document.getElementById('an_refresh').onclick=anLoadSessions;
-document.getElementById('an_view').onchange=function(){ if(_anData) anShowFrame(_anIdx); };
-document.getElementById('an_method').onchange=function(){
-  if(_anData && document.getElementById('an_view').value==='proc') anShowFrame(_anIdx);
-};
-document.getElementById('an_reanalyze').onclick=async function(){
-  if(!_anData) return;
-  const method=document.getElementById('an_method').value;
-  const note=document.getElementById('an_compare');
-  note.style.color='#7d96a3'; note.textContent='re-analyzing run with '+method+' on the Pi, this can take a bit...';
-  try{
-    const d=await (await fetch('/session/'+_anData.name+'/reanalyze?method='+method,{cache:'no-store'})).json();
-    if(d.error){ note.style.color='#d9534f'; note.textContent='re-analyze failed: '+d.error; return; }
-    _anData.reCenter=d.center||null;
-    let rec=null; const i=_anData.cols.indexOf('center_pct');
-    if(i>=0){ const xs=[]; for(const r of _anData.rows){ const v=parseFloat(r[i]); if(!isNaN(v)) xs.push(v); }
-      if(xs.length) rec=xs.reduce((a,b)=>a+b,0)/xs.length; }
-    note.style.color='#3fd0a8';
-    note.textContent=method+' avg center '+(d.avg_center!=null? d.avg_center+'%':'--')+
-      (rec!=null? ('  vs recorded '+rec.toFixed(1)+'%'):'')+'  ('+d.frames+' frames). Amber line on the chart is the re-analysis.';
-    anRenderCharts(_anIdx);
-  }catch(e){ note.style.color='#d9534f'; note.textContent='re-analyze failed: '+e.message; }
-};
-
-// ---- Controls: add a button by adding one entry here. Danger buttons require
-// a second click to confirm. Shell actions need a matching ALLOWED_ACTIONS entry
-// on the server; subsystem actions (estop, record) wire up once those exist. ----
-const CONTROLS = [
-  { id:'zeroyaw',  label:'Zero heading', action:'imu_zero' },
-  { id:'snap',     label:'Snapshot',     action:'snapshot' },
-  { id:'restart',  label:'Restart vision', action:'restart', danger:true, reconnect:true, confirm:'Click again to restart' },
-  { id:'reboot', label:'Reboot Pi', action:'reboot', danger:true, reconnect:true, confirm:'Click again to reboot' },
-  { id:'shutdown', label:'Shut down', action:'shutdown', danger:true, confirm:'Click again to shut down' },
-  // { id:'estop',    label:'Emergency stop', action:'estop', danger:true },  // needs control loop
-];
-// Below this ground speed, show the GPS as stopped. Stationary receivers never
-// read exactly zero (Doppler noise floor). Set to 0 to show the raw value.
-const SPEED_DEADBAND_MS = 0.15;
-// Empty = keyless Google Maps embed (no setup, but unofficial). To use the
-// supported Maps Embed API, put a key here (free, needs a Google Cloud project).
-const GMAPS_KEY = '';
-const _armed = {};
-const _armTimers = {};
-function makeControls(){
-  const wrap = document.getElementById('ctrl_buttons');
-  CONTROLS.forEach(function(c){
-    const btn = document.createElement('button');
-    btn.className = 'btn' + (c.danger ? ' danger' : '');
-    btn.textContent = c.label;
-    btn.onclick = function(){ onControlClick(c, btn); };
-    wrap.appendChild(btn);
-  });
-}
-function disarm(c, btn){
-  _armed[c.id] = false;
-  clearTimeout(_armTimers[c.id]);
-  btn.classList.remove('armed');
-  btn.textContent = c.label;
-}
-function onControlClick(c, btn){
-  if (c.danger && !_armed[c.id]){
-    _armed[c.id] = true;
-    btn.classList.add('armed');
-    btn.textContent = c.confirm || 'Click again to confirm';
-    clearTimeout(_armTimers[c.id]);
-    _armTimers[c.id] = setTimeout(function(){ disarm(c, btn); }, 4000);
-    return;
-  }
-  disarm(c, btn);
-  runControl(c, btn);
-}
-async function runControl(c, btn){
-  const st = document.getElementById('ctrl_status');
-  st.style.color = '#7d96a3';
-  st.textContent = c.label + ': sending...';
-  const drops = c.action==='reboot' || c.action==='shutdown' || c.action==='restart';
-  try {
-    const r = await fetch('/action/' + c.action, { method: 'POST' });
-    let d = {};
-    try { d = await r.json(); } catch(e){}
-    if (r.ok && d.ok !== false){
-      st.style.color = '#3fd0a8';
-      st.textContent = d.message || (c.label + ' sent');
-      afterControl(c, st);
-    } else {
-      st.style.color = '#d9534f';
-      st.textContent = c.label + ' failed: ' + (d.error || ('HTTP ' + r.status));
-    }
-  } catch(e){
-    if (drops){
-      st.style.color = '#d9b13a';
-      st.textContent = c.label + ' sent.';
-      afterControl(c, st);
-    } else {
-      st.style.color = '#d9534f';
-      st.textContent = c.label + ' failed: ' + e.message;
-    }
-  }
-}
-function afterControl(c, st){
-  if (c.action === 'restart'){
-    st.textContent += ' Reconnecting in a few seconds...';
-    setTimeout(function(){ location.reload(); }, 6000);
-  } else if (c.action === 'reboot'){
-    st.textContent += ' Page will return after the Pi reboots (~30s).';
-  } else if (c.action === 'shutdown'){
-    st.textContent += ' This page will go offline.';
-  }
-}
-
-// ---- GPS map: reload the iframe only on first fix or after moving ~8 m, so a
-// stationary boat doesn't flicker the map every second. Satellite view. ----
-let _mapLat = null, _mapLon = null;
-function gmapUrl(lat, lon){
-  if (GMAPS_KEY){
-    return 'https://www.google.com/maps/embed/v1/place?key=' + GMAPS_KEY +
-           '&q=' + lat + ',' + lon + '&zoom=19&maptype=satellite';
-  }
-  return 'https://maps.google.com/maps?q=' + lat + ',' + lon + '&z=19&t=k&output=embed';
-}
-function updateMap(lat, lon){
-  if (_mapLat !== null){
-    const dN = (lat - _mapLat) * 111320;
-    const dE = (lon - _mapLon) * 111320 * Math.cos(lat * Math.PI / 180);
-    if (Math.hypot(dN, dE) < 8) return;  // moved less than 8 m, leave the map alone
-  }
-  _mapLat = lat; _mapLon = lon;
-  const f = document.getElementById('g_map');
-  f.style.display = 'block';
-  f.src = gmapUrl(lat, lon);
-}
-
-function hullFront(ctx){
-  // twin demihulls (bow-on)
-  ctx.beginPath();
-  ctx.moveTo(-78,-10); ctx.lineTo(-70,14); ctx.lineTo(-58,24);
-  ctx.lineTo(-46,22); ctx.lineTo(-38,6); ctx.lineTo(-36,-10); ctx.closePath();
-  ctx.moveTo(78,-10); ctx.lineTo(70,14); ctx.lineTo(58,24);
-  ctx.lineTo(46,22); ctx.lineTo(38,6); ctx.lineTo(36,-10); ctx.closePath();
-  ctx.stroke();
-  // bridge deck across the top + tunnel ceiling between the hulls
-  ctx.beginPath();
-  ctx.moveTo(-78,-10); ctx.lineTo(-78,-22); ctx.lineTo(78,-22); ctx.lineTo(78,-10);
-  ctx.moveTo(-36,-10); ctx.lineTo(36,-10);
-  ctx.stroke();
-  ctx.strokeRect(-16,-35,32,13);                                         // electronics box
-  ctx.beginPath(); ctx.moveTo(0,-35); ctx.lineTo(0,-50); ctx.stroke();   // camera/antenna stub
-  ctx.beginPath(); ctx.moveTo(-80,10); ctx.lineTo(-94,10);
-  ctx.moveTo(80,10); ctx.lineTo(94,10); ctx.stroke();                    // waterline ticks
-}
-function hullSide(ctx){
-  // far demihull, dimmed and offset to imply the second hull
-  ctx.save();
-  ctx.strokeStyle='rgba(215,227,234,0.38)';
-  ctx.beginPath();
-  ctx.moveTo(-85,-9); ctx.lineTo(81,-9); ctx.lineTo(115,3);
-  ctx.lineTo(77,31); ctx.lineTo(-81,31); ctx.lineTo(-89,9); ctx.closePath();
-  ctx.stroke();
-  ctx.restore();
-  // near demihull (bow to the right)
-  ctx.beginPath();
-  ctx.moveTo(-90,-16); ctx.lineTo(76,-16); ctx.lineTo(110,-4);
-  ctx.lineTo(72,24); ctx.lineTo(-86,24); ctx.lineTo(-94,2); ctx.closePath();
-  ctx.stroke();
-  ctx.strokeRect(-56,-30,92,14);                                         // wide flat bridge deck
-  ctx.beginPath(); ctx.moveTo(20,-30); ctx.lineTo(20,-46); ctx.stroke(); // camera/antenna stub
-}
-function drawScene(canvas, angleDeg, kind){
-  const ctx=canvas.getContext('2d');
-  const W=canvas.width, H=canvas.height;
-  const cx=W/2, cy=H*0.58, R=Math.min(W,H)*0.40;
-  const isRoll = kind==='front';
-  ctx.clearRect(0,0,W,H);
-  ctx.fillStyle='#0c1014'; ctx.fillRect(0,0,W,H);
-  ctx.strokeStyle='rgba(125,150,163,0.09)'; ctx.lineWidth=1;
-  for(let g=0; g<=W; g+=30){ ctx.beginPath(); ctx.moveTo(g,0); ctx.lineTo(g,H); ctx.stroke(); }
-  for(let g=0; g<=H; g+=30){ ctx.beginPath(); ctx.moveTo(0,g); ctx.lineTo(W,g); ctx.stroke(); }
-  ctx.save();
-  ctx.translate(cx,cy);
-  const range = isRoll?60:45;
-  ctx.font='11px ui-monospace, monospace'; ctx.textAlign='center'; ctx.textBaseline='middle';
-  for(let v=-range; v<=range; v+=5){
-    const maj = (v%15===0), a=v*Math.PI/180;
-    const ux = isRoll?Math.sin(a):Math.cos(a);
-    const uy = isRoll?-Math.cos(a):-Math.sin(a);
-    ctx.strokeStyle = maj?'rgba(174,191,201,0.85)':'rgba(125,150,163,0.4)';
-    ctx.lineWidth = maj?1.3:1;
-    ctx.beginPath(); ctx.moveTo(ux*R,uy*R); ctx.lineTo(ux*(R+(maj?10:6)),uy*(R+(maj?10:6))); ctx.stroke();
-    if(maj){ ctx.fillStyle='rgba(143,163,173,0.9)'; ctx.fillText((v>0?'+':'')+v, ux*(R+22), uy*(R+22)); }
-  }
-  ctx.strokeStyle='rgba(125,150,163,0.22)'; ctx.setLineDash([4,4]); ctx.lineWidth=1;
-  ctx.beginPath();
-  if(isRoll){ ctx.moveTo(0,8); ctx.lineTo(0,-R); } else { ctx.moveTo(-R,0); ctx.lineTo(R+12,0); }
-  ctx.stroke(); ctx.setLineDash([]);
-  ctx.save();
-  ctx.rotate((isRoll?angleDeg:-angleDeg)*Math.PI/180);
-  ctx.strokeStyle='#d7e3ea'; ctx.lineWidth=1.4; ctx.lineJoin='round'; ctx.lineCap='round';
-  if(isRoll) hullFront(ctx); else hullSide(ctx);
-  ctx.strokeStyle='#3fd0a8'; ctx.lineWidth=2;
-  ctx.beginPath();
-  if(isRoll){ ctx.moveTo(0,0); ctx.lineTo(0,-R); } else { ctx.moveTo(0,0); ctx.lineTo(R,0); }
-  ctx.stroke();
-  ctx.fillStyle='#3fd0a8'; ctx.beginPath();
-  if(isRoll) ctx.arc(0,-R,3,0,7); else ctx.arc(R,0,3,0,7);
-  ctx.fill();
-  ctx.restore();
-  ctx.restore();
-}
-const cRoll=document.getElementById('cRoll'), cPitch=document.getElementById('cPitch');
-const readout=document.getElementById('readout');
-function fmt(v){ const n=v.toFixed(1); return (v>=0?'+':'')+n; }
-async function attTick(){
-  try{
-    const d=await (await fetch('/data',{cache:'no-store'})).json();
-    if(!d.ok){
-      drawScene(cRoll, 0, 'front');
-      drawScene(cPitch, 0, 'side');
-      readout.innerHTML='<span class="stale">IMU offline</span>';
-      return;
-    }
-    drawScene(cRoll, d.roll, 'front');
-    drawScene(cPitch, d.pitch, 'side');
-    readout.innerHTML = 'ROLL <span>'+fmt(d.roll)+'\\u00B0</span> &nbsp; PITCH <span>'+fmt(d.pitch)+
-      '\\u00B0</span> &nbsp; <span class="drift">YAW '+fmt(d.yaw)+'\\u00B0 drift</span>';
-  }catch(e){
-    readout.innerHTML='<span class="stale">link lost, retrying...</span>';
-  }
-}
-function set(id, html, color){
-  const el=document.getElementById(id);
-  el.innerHTML=html;
-  if(color) el.style.color=color;
-}
-function upt(s){
-  if(s==null) return '--';
-  const d=Math.floor(s/86400); s%=86400;
-  const h=Math.floor(s/3600); s%=3600;
-  const m=Math.floor(s/60);
-  if(d>0) return d+'d '+h+'h '+m+'m';
-  if(h>0) return h+'h '+m+'m';
-  return m+'m';
-}
-// Self-paced camera frame loader: only requests the next frame after the
-// current one finishes loading, so it adapts to bandwidth instead of piling up.
-function frameTick(){
-  const img = new Image();
-  img.onload = function(){ document.getElementById('cam').src = img.src; setTimeout(frameTick, 120); };
-  img.onerror = function(){ setTimeout(frameTick, 600); };
-  img.src = '/frame?t=' + Date.now();
-}
-async function procTick(){
-  let d;
-  try { d=await (await fetch('/proc',{cache:'no-store'})).json(); }
-  catch(e){ return; }
-  if(!d.cam_ok){
-    set('p_fps','--','#7d96a3'); set('p_lat','--','#7d96a3');
-    set('p_zone','--','#7d96a3'); set('p_center','--','#7d96a3');
-    set('c_mode','--','#7d96a3'); set('c_thr','--','#7d96a3');
-    set('c_turn','--','#7d96a3'); set('c_left','--','#7d96a3'); set('c_right','--','#7d96a3');
-    document.getElementById('c_reason').textContent='camera offline';
-    return;
-  }
-  set('p_fps', d.fps.toFixed(1)+'<small> fps</small>',
-      d.fps>=20?'#3fd0a8':d.fps>=10?'#d9b13a':'#d9534f');
-  set('p_lat', Math.round(d.latency_ms)+'<small> ms</small>',
-      d.latency_ms<=33?'#3fd0a8':d.latency_ms<=66?'#d9b13a':'#d9534f');
-  set('p_zone', 'Z'+d.best_zone+'<small> / 4</small>','#e6eef2');
-  set('p_center', Math.round(d.center_pct)+'<small> %</small>',
-      d.center_pct>=35?'#3fd0a8':d.center_pct>=25?'#d9b13a':'#d9534f');
-  const c = d.cmd;
-  if(c){
-    const mc = c.mode==='run'?'#3fd0a8':(c.mode==='search'?'#d9b13a':'#d9534f');
-    set('c_mode', c.mode, mc);
-    set('c_thr', (c.throttle>=0?'+':'')+Math.round(c.throttle*100)+'<small> %</small>', '#e6eef2');
-    set('c_turn', (c.turn>=0?'R ':'L ')+Math.abs(Math.round(c.turn*100))+'<small> %</small>', '#e6eef2');
-    set('c_left', (c.left>=0?'+':'')+Math.round(c.left*100)+'<small> %</small>', '#e6eef2');
-    set('c_right', (c.right>=0?'+':'')+Math.round(c.right*100)+'<small> %</small>', '#e6eef2');
-    document.getElementById('c_reason').textContent = (c.armed?'ARMED - ':'dry-run - ')+c.reason;
-  }
-}
-async function gpsTick(){
-  let d;
-  try { d=await (await fetch('/gps',{cache:'no-store'})).json(); }
-  catch(e){ return; }
-  const pos = document.getElementById('g_pos');
-  if(!d.connected){
-    set('g_fix','<small>no device</small>','#7d96a3');
-    set('g_sats','--','#7d96a3'); set('g_hdop','--','#7d96a3');
-    set('g_speed','--','#7d96a3'); set('g_course','--','#7d96a3');
-    pos.textContent = 'GPS not detected. Plug in the receiver; stop gpsd if it is running.';
-    return;
-  }
-  const fix = d.fix_type || 'none';
-  if(fix==='3D' && d.valid) set('g_fix','3D','#3fd0a8');
-  else if(fix==='2D' && d.valid) set('g_fix','2D','#d9b13a');
-  else set('g_fix','NONE','#d9534f');
-  set('g_sats', (d.sats_used!=null?d.sats_used:'--')+'<small> / '+(d.sats_view!=null?d.sats_view:'--')+'</small>','#e6eef2');
-  if(d.hdop!=null) set('g_hdop', d.hdop, d.hdop<=2?'#3fd0a8':d.hdop<=5?'#d9b13a':'#d9534f');
-  else set('g_hdop','--','#7d96a3');
-  if(d.sog_ms!=null){
-    const v = d.sog_ms < SPEED_DEADBAND_MS ? 0 : d.sog_ms;
-    set('g_speed', v.toFixed(2)+'<small> m/s</small>','#e6eef2');
-  } else set('g_speed','--','#7d96a3');
-  set('g_course', d.cog!=null? Math.round(d.cog)+'<small> deg</small>' : '<small>--</small>', '#e6eef2');
-  if(d.lat!=null && d.lon!=null){
-    pos.textContent = d.lat.toFixed(6)+', '+d.lon.toFixed(6) +
-      (d.alt!=null? '   alt '+Math.round(d.alt)+' m':'') +
-      (d.utc? '   UTC '+d.utc:'') +
-      (d.age_s!=null && d.age_s>3? '   (stale '+d.age_s+'s)':'');
-    updateMap(d.lat, d.lon);
-  } else {
-    pos.textContent = 'no fix yet' + (d.sats_view!=null? ' ('+d.sats_view+' sats in view, needs sky view)':'');
-  }
-}
-async function sysTick(){
-  let d;
-  try { d=await (await fetch('/sys',{cache:'no-store'})).json(); }
-  catch(e){ return; }
-  if(d.imu_hz==null) set('m_hz','--');
-  else set('m_hz', d.imu_hz.toFixed(1)+'<small> Hz</small>',
-           d.imu_hz>=95?'#3fd0a8':d.imu_hz>=50?'#d9b13a':'#d9534f');
-  if(d.temp_c==null) set('m_temp','--','#7d96a3');
-  else set('m_temp', d.temp_c.toFixed(1)+'<small> \\u00B0C</small>',
-           d.temp_c>=78?'#d9534f':d.temp_c>=65?'#d9b13a':'#3fd0a8');
-  if(d.cpu_pct==null) set('m_cpu','--','#e6eef2');
-  else set('m_cpu', Math.round(d.cpu_pct)+'<small> %</small>'+(d.load1!=null?' <small>('+d.load1.toFixed(2)+')</small>':''),
-           d.cpu_pct>=95?'#d9534f':d.cpu_pct>=85?'#d9b13a':'#e6eef2');
-  if(d.mem_pct==null) set('m_mem','--');
-  else set('m_mem', d.mem_used_mb+'<small> / '+d.mem_total_mb+' MB</small>',
-           d.mem_pct>=92?'#d9534f':d.mem_pct>=80?'#d9b13a':'#e6eef2');
-  set('m_disk', d.disk_pct!=null? Math.round(d.disk_pct)+'<small> % used</small>':'--');
-  set('m_up', upt(d.uptime_s));
-  set('m_ssid', d.ssid? d.ssid : '<small>offline</small>', d.ssid?'#e6eef2':'#d9534f');
-  if(d.wifi_dbm==null) set('m_wifi','--');
-  else set('m_wifi', d.wifi_dbm+'<small> dBm ('+d.wifi_pct+'%)</small>',
-           d.wifi_dbm<=-78?'#d9534f':d.wifi_dbm<=-67?'#d9b13a':'#e6eef2');
-  set('m_ip', d.ip? '<small>'+d.ip+'</small>' : '--', '#e6eef2');
-  const pw=document.getElementById('m_power');
-  if(d.under_voltage){ pw.textContent='POWER: undervoltage now - the Pi 5V rail is sagging under load. Expect resets and SD corruption; check the supply.';
-    pw.style.color='#fff'; pw.style.background='#7a1f1f'; pw.style.borderColor='#d9534f'; }
-  else if(d.throttled_now){ pw.textContent='POWER: throttled now - CPU has clocked down to cope with low voltage.';
-    pw.style.color='#f0c067'; pw.style.background='#0c1014'; pw.style.borderColor='#d9b13a'; }
-  else if(d.uv_occurred){ pw.textContent='POWER: undervoltage occurred earlier this session - the rail dipped at least once since boot. Stable now.';
-    pw.style.color='#d9b13a'; pw.style.background='#0c1014'; pw.style.borderColor='#3a3320'; }
-  else if(d.under_voltage===false){ pw.textContent='POWER: OK - 5V rail stable, no throttling.';
-    pw.style.color='#3fd0a8'; pw.style.background='#0c1014'; pw.style.borderColor='#1b2530'; }
-  else { pw.textContent='POWER: vcgencmd unavailable (cannot read rail state).'; pw.style.color='#7d96a3'; }
-}
-async function powerTick(){
-  let d;
-  try { d=await (await fetch('/power',{cache:'no-store'})).json(); }
-  catch(e){ return; }
-  const cr=d.critical, ov=document.getElementById('crit_overlay');
-  if(cr && cr.armed){
-    document.getElementById('crit_secs').textContent=(cr.seconds_left!=null?cr.seconds_left:0);
-    ov.style.display='flex';
-  } else { ov.style.display='none'; }
-  const s=document.getElementById('pw_status');
-  if(!d.connected){
-    set('pw_pack','--','#7d96a3'); set('pw_cur','--','#7d96a3');
-    set('pw_w','--','#7d96a3'); set('pw_rail','--','#7d96a3');
-    s.textContent='pack: sensor offline'; s.style.color='#7d96a3';
-    return;
-  }
-  if(d.pack_v==null) set('pw_pack','--');
-  else set('pw_pack', d.pack_v.toFixed(2)+'<small> V</small>',
-           d.pack_v<6.0?'#d9534f':d.pack_v<6.6?'#d9b13a':'#3fd0a8');
-  set('pw_cur', d.current_ma!=null? (d.current_ma/1000).toFixed(2)+'<small> A</small>':'--', '#e6eef2');
-  set('pw_w', d.power_w!=null? d.power_w.toFixed(2)+'<small> W</small>':'--', '#e6eef2');
-  set('pw_rail', d.rail_v!=null? d.rail_v.toFixed(2)+'<small> V</small>':'--', '#7d96a3');
-  const age = d.age_s!=null? ' ('+d.age_s+'s ago)':'';
-  if(d.status==='critical'){ s.textContent='PACK CRITICAL - stop'+age; s.style.color='#d9534f'; }
-  else if(d.status==='low'){ s.textContent='PACK LOW - return to shore'+age; s.style.color='#d9b13a'; }
-  else { s.textContent='pack ok'+age; s.style.color='#3fd0a8'; }
-}
-let _capRec = false;
-async function capPoll(){
-  try{
-    const d = await (await fetch('/capture',{cache:'no-store'})).json();
-    _capRec = d.recording;
-    const btn = document.getElementById('cap_btn');
-    const st = document.getElementById('cap_status');
-    btn.textContent = d.recording ? 'Stop capture' : 'Start capture';
-    btn.classList.toggle('armed', d.recording);
-    if (d.error){ st.style.color = '#d9534f'; st.textContent = d.error; }
-    else if (d.recording){
-      st.style.color = '#3fd0a8';
-      st.textContent = 'recording ' + d.session + ' | ' + d.frames + ' frames | ' +
-        d.elapsed + 's | free ' + (d.free_mb != null ? Math.round(d.free_mb) + ' MB' : '--');
-    } else {
-      st.style.color = '#7d96a3';
-      if (d.last_session){
-        st.textContent = 'idle | last: ' + d.last_session + ' | ' +
-          d.last_frames + ' frames | ' + d.last_duration + 's';
-      } else {
-        st.textContent = 'idle | no captures yet';
-      }
-    }
-  }catch(e){}
-}
-async function capToggle(){
-  const btn = document.getElementById('cap_btn');
-  btn.disabled = true;
-  try{
-    const path = _capRec ? '/capture/stop' : '/capture/start';
-    const d = await (await fetch(path, { method:'POST' })).json();
-    if (d.ok === false){
-      const st = document.getElementById('cap_status');
-      st.style.color = '#d9534f'; st.textContent = d.error || 'failed';
-    }
-  }catch(e){}
-  btn.disabled = false;
-  capPoll();
-}
-document.getElementById('cap_btn').onclick = capToggle;
-makeControls();
-document.getElementById('crit_override').onclick=async function(){
-  const note=document.getElementById('crit_note');
-  note.textContent='overriding...';
-  try{ const r=await (await fetch('/action/critical_override',{method:'POST'})).json();
-       note.textContent=r.message||(r.ok?'overridden':'override failed'); }
-  catch(e){ note.textContent='override failed: '+e.message; }
-};
-setInterval(attTick, 50); attTick();
-setInterval(sysTick, 1500); sysTick();
-setInterval(procTick, 500); procTick();
-setInterval(gpsTick, 1000); gpsTick();
-setInterval(powerTick, 1000); powerTick();
-frameTick();
-setInterval(capPoll, 1000); capPoll();
-</script>
-</body>
-</html>"""
+        with open(os.path.join(STATIC_DIR, "index.html"), "rb") as f:
+            return f.read()
+    except Exception as e:
+        return ("<html><body><h2>AutoBoat dashboard</h2><p>static/index.html "
+                "missing or unreadable (%s). Deploy the static folder next to "
+                "autoboat_dashboard.py.</p></body></html>" % e).encode()
 
 
 class Handler(BaseHTTPRequestHandler):
     def log_message(self, *args):
         pass
 
-    def _send(self, body, ctype):
+    def _send(self, body, ctype, no_cache=False):
         self.send_response(200)
         self.send_header("Content-Type", ctype)
         self.send_header("Content-Length", str(len(body)))
+        if no_cache:
+            self.send_header("Cache-Control", "no-store")
         self.end_headers()
         self.wfile.write(body)
 
@@ -2160,12 +99,13 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
+    # ---------------- POST ----------------
     def do_POST(self):
         if self.path == "/capture/start":
-            self._json(capture_start())
+            self._json(recording.capture_start())
             return
         if self.path == "/capture/stop":
-            self._json(capture_stop())
+            self._json(recording.capture_stop())
             return
         if self.path.startswith("/action/"):
             name = self.path[len("/action/"):].strip("/")
@@ -2198,6 +138,7 @@ class Handler(BaseHTTPRequestHandler):
             self.send_header("Content-Length", "0")
             self.end_headers()
 
+    # ---------------- session routes ----------------
     def _handle_session(self):
         full = self.path[len("/session/"):]
         rest, _, query = full.partition("?")
@@ -2206,7 +147,7 @@ class Handler(BaseHTTPRequestHandler):
             self._json({"error": "bad request"}, code=400)
             return
         name, what = parts[0], parts[1]
-        sdir = _safe_session_dir(name)
+        sdir = recording._safe_session_dir(name)
         if sdir is None:
             self._json({"error": "no such session"}, code=404)
             return
@@ -2217,119 +158,102 @@ class Handler(BaseHTTPRequestHandler):
         if method not in ("texture", "color"):
             method = "texture"
         if what == "manifest":
-            man = _read_json_file(os.path.join(sdir, "manifest.json"))
+            man = recording._read_json_file(os.path.join(sdir, "manifest.json"))
             self._json(man if man is not None else {})
         elif what == "telemetry":
-            cols, rows = _read_telemetry(sdir)
+            cols, rows = recording._read_telemetry(sdir)
             self._send(json.dumps({"columns": cols or [], "rows": rows or []}).encode(),
                        "application/json")
         elif what == "events":
-            txt = _read_text_file(os.path.join(sdir, "events.log")) or ""
+            txt = recording._read_text_file(os.path.join(sdir, "events.log")) or ""
             self._send(txt.encode(), "text/plain; charset=utf-8")
         elif what == "gps":
-            cols, rows = _read_telemetry(sdir)
-            self._send(json.dumps({"points": _gps_points(cols, rows or [])}).encode(),
+            cols, rows = recording._read_telemetry(sdir)
+            self._send(json.dumps({"points": recording._gps_points(cols, rows or [])}).encode(),
                        "application/json")
         elif what == "frame" and len(parts) >= 3 and parts[2].isdigit():
-            fp = os.path.join(sdir, "frames", "frame_%06d.jpg" % int(parts[2]))
-            if os.path.isfile(fp):
+            fp = recording._frame_file(os.path.join(sdir, "frames"), int(parts[2]))
+            if fp and os.path.isfile(fp):
+                ctype = "image/png" if fp.endswith(".png") else "image/jpeg"
                 try:
                     with open(fp, "rb") as f:
-                        self._send(f.read(), "image/jpeg")
+                        self._send(f.read(), ctype)
                 except Exception:
                     self.send_response(500); self.send_header("Content-Length", "0"); self.end_headers()
             else:
                 self.send_response(404); self.send_header("Content-Length", "0"); self.end_headers()
         elif what == "analyze" and len(parts) >= 3 and parts[2].isdigit():
-            # Re-run the pipeline on one saved frame, on the Pi, and return the
-            # annotated overlay. Lets the Analyze tab show processed frames.
-            if not CAMERA_AVAILABLE:
-                self._json({"error": "vision stack unavailable"}, code=503); return
-            fp = os.path.join(sdir, "frames", "frame_%06d.jpg" % int(parts[2]))
-            if not os.path.isfile(fp):
+            fp = recording._frame_file(os.path.join(sdir, "frames"), int(parts[2]))
+            if not fp or not os.path.isfile(fp):
                 self.send_response(404); self.send_header("Content-Length", "0"); self.end_headers(); return
             try:
-                img = cv2.imread(fp)            # BGR, matches how frames were saved
-                res = analyze(img, is_rgb=False, method=method)
-                vis = annotate(img, res, is_rgb=False)
-                ok, buf = cv2.imencode(".jpg", vis, [int(cv2.IMWRITE_JPEG_QUALITY), 85])
-                if not ok:
-                    raise RuntimeError("encode failed")
-                self._send(buf.tobytes(), "image/jpeg")
+                self._send(pilot.analyze_frame_file(fp, method), "image/jpeg")
             except Exception as e:
-                self._json({"error": str(e)}, code=500)
+                code = 503 if "unavailable" in str(e) else 500
+                self._json({"error": str(e)}, code=code)
         elif what == "reanalyze":
-            # Re-run the pipeline over the whole session with the chosen method and
-            # return the recomputed center-water series + summary, for comparison.
-            if not CAMERA_AVAILABLE:
-                self._json({"error": "vision stack unavailable"}, code=503); return
-            centers, zones, i = [], [], 0
-            while i < 20000:
-                fp = os.path.join(sdir, "frames", "frame_%06d.jpg" % i)
-                if not os.path.isfile(fp):
-                    break
-                img = cv2.imread(fp)
-                if img is None:
-                    break
-                try:
-                    res = analyze(img, is_rgb=False, method=method)
-                    centers.append(round(float(res.center_depth_pct), 1))
-                    zones.append(int(res.best_zone))
-                except Exception:
-                    centers.append(None); zones.append(None)
-                i += 1
-            valid = [c for c in centers if c is not None]
-            hist = [0, 0, 0, 0, 0]
-            for z in zones:
-                if z is not None and 0 <= z < 5:
-                    hist[z] += 1
-            self._json({"method": method, "frames": len(centers), "center": centers,
-                        "best_zone_hist": hist,
-                        "avg_center": round(sum(valid) / len(valid), 1) if valid else None})
+            try:
+                out = pilot.reanalyze_session(os.path.join(sdir, "frames"), method,
+                                              recording._frame_file)
+                self._json(out)
+            except Exception as e:
+                code = 503 if "unavailable" in str(e) else 500
+                self._json({"error": str(e)}, code=code)
         else:
             self._json({"error": "unknown resource"}, code=404)
 
+    # ---------------- GET ----------------
     def do_GET(self):
         if self.path == "/sessions" or self.path.startswith("/sessions?"):
-            self._send(json.dumps(_list_sessions()).encode(), "application/json")
+            self._send(json.dumps(recording._list_sessions()).encode(), "application/json")
             return
         if self.path.startswith("/session/"):
             self._handle_session()
             return
         if self.path.startswith("/data"):
-            with alock:
+            with imu.alock:
                 body = json.dumps({
-                    "ok": att["ok"],
-                    "roll": math.degrees(att["roll"]),
-                    "pitch": math.degrees(att["pitch"]),
-                    "yaw": math.degrees(att["yaw"]),
+                    "ok": imu.att["ok"],
+                    "roll": math.degrees(imu.att["roll"]),
+                    "pitch": math.degrees(imu.att["pitch"]),
+                    "yaw": math.degrees(imu.att["yaw"]),
                 }).encode()
             self._send(body, "application/json")
         elif self.path.startswith("/sys"):
-            with slock:
-                data = dict(sysm)
-            with alock:
-                data["imu_hz"] = round(att["hz"], 1)
+            with sysmon.slock:
+                data = dict(sysmon.sysm)
+            with imu.alock:
+                data["imu_hz"] = round(imu.att["hz"], 1)
             self._send(json.dumps(data).encode(), "application/json")
         elif self.path.startswith("/proc"):
-            with plock:
-                body = json.dumps(dict(proc)).encode()
-            self._send(body, "application/json")
+            with pilot.plock:
+                data = dict(pilot.proc)
+            data["throttle_cap"] = motors.MOTOR_THROTTLE_CAP
+            data["motors_available"] = motors.MOTORS_AVAILABLE
+            self._send(json.dumps(data).encode(), "application/json")
+        elif self.path.startswith("/tof"):
+            with hwtof.tlock:
+                data = dict(hwtof.tof)
+            ld = data.pop("last_data", 0.0)
+            data["age_s"] = round(time.monotonic() - ld, 1) if (data["connected"] and ld) else None
+            data["lib"] = hwtof.TOF_LIB_AVAILABLE
+            self._send(json.dumps(data).encode(), "application/json")
         elif self.path.startswith("/gps"):
-            with glock:
-                data = dict(gps)
+            with hwgps.glock:
+                data = dict(hwgps.gps)
             ld = data.pop("last_data", 0.0)
             data["age_s"] = round(time.monotonic() - ld, 1) if (data["connected"] and ld) else None
             self._send(json.dumps(data).encode(), "application/json")
         elif self.path.startswith("/power"):
-            with pwlock:
-                data = dict(power)
+            with hwpower.pwlock:
+                data = dict(hwpower.power)
             ld = data.pop("last_data", 0.0)
             data["age_s"] = round(time.monotonic() - ld, 1) if (data["connected"] and ld) else None
-            data["critical"] = _critical_status()
+            data["critical"] = hwpower._critical_status()
             self._send(json.dumps(data).encode(), "application/json")
         elif self.path.startswith("/capture"):
-            with caplock:
+            with recording.caplock:
+                cap = recording.cap
                 st = {"recording": cap["recording"], "frames": cap["frames"],
                       "elapsed": round(time.monotonic() - cap["started"], 1) if cap["recording"] else 0,
                       "session": os.path.basename(cap["session"]) if cap["session"] else None,
@@ -2338,8 +262,8 @@ class Handler(BaseHTTPRequestHandler):
                       "last_duration": cap["last_duration"]}
             self._send(json.dumps(st).encode(), "application/json")
         elif self.path.startswith("/frame"):
-            with flock:
-                buf = frame_buf["jpeg"]
+            with pilot.flock:
+                buf = pilot.frame_buf["jpeg"]
             if buf is None:
                 self.send_response(503)
                 self.send_header("Content-Length", "0")
@@ -2347,29 +271,35 @@ class Handler(BaseHTTPRequestHandler):
                 return
             self._send(buf, "image/jpeg")
         else:
-            self._send(PAGE, "text/html; charset=utf-8")
+            # no-store so editing static/index.html shows up on a plain refresh
+            self._send(_index_page(), "text/html; charset=utf-8", no_cache=True)
 
 
 if __name__ == "__main__":
-    if IMU_AVAILABLE:
-        threading.Thread(target=imu_loop, daemon=True).start()
+    if imu.IMU_AVAILABLE:
+        threading.Thread(target=imu.imu_loop, daemon=True).start()
     else:
         print("imu disabled; attitude section will show offline")
-    threading.Thread(target=sys_loop, daemon=True).start()
-    if CAMERA_AVAILABLE:
-        threading.Thread(target=camera_loop, daemon=True).start()
+    threading.Thread(target=sysmon.sys_loop, daemon=True).start()
+    threading.Thread(target=motors.watchdog, daemon=True).start()
+    if pilot.CAMERA_AVAILABLE:
+        threading.Thread(target=pilot.camera_loop, daemon=True).start()
     else:
         print("camera/vision disabled; dashboard will show -- for those cards")
-    if GPS_AVAILABLE:
-        threading.Thread(target=gps_loop, daemon=True).start()
+    if hwgps.GPS_AVAILABLE:
+        threading.Thread(target=hwgps.gps_loop, daemon=True).start()
     else:
         print("gps disabled; install pyserial to enable the GPS section")
-    if INA_AVAILABLE:
-        threading.Thread(target=power_loop, daemon=True).start()
+    if hwtof.TOF_LIB_AVAILABLE:
+        threading.Thread(target=hwtof.tof_loop, daemon=True).start()
+    else:
+        print("tof disabled; range gate inactive until the VL53L1X + library are present")
+    if hwpower.INA_AVAILABLE:
+        threading.Thread(target=hwpower.power_loop, daemon=True).start()
     else:
         print("power disabled; install adafruit-circuitpython-ina219 and "
               "adafruit-extended-bus to enable the Power section")
-    print("AutoBoat2w dashboard running. From a device on the same network open:")
+    print("AutoBoat dashboard running. From a device on the same network open:")
     print("  http://<this-pi-ip>:%d" % PORT)
     print("Find the Pi IP with:  hostname -I")
     ThreadingHTTPServer(("0.0.0.0", PORT), Handler).serve_forever()

@@ -66,9 +66,8 @@ def step(motor, name, direction, duty, secs):
 
 def guided(duty, secs):
     print(__doc__)
-    if input("Props off and hulls secured? Type 'yes' to continue: ").strip().lower() != "yes":
-        print("Aborting. Secure the boat first.")
-        return
+    print("Props off and hulls secured. Starting in 2s, Ctrl-C to abort.")
+    time.sleep(2)
 
     print("\nEnabling driver briefly with both channels idle. Nothing should move.")
     enable.on()
@@ -82,15 +81,30 @@ def guided(duty, secs):
     step(right, "RIGHT motor", "reverse", duty, secs)
 
     # PWM sanity: ramp the left motor up so you can confirm speed tracks duty.
-    input("\nPress Enter for a speed ramp on the LEFT motor (20% -> 60%) ...")
+    input("\nPress Enter for a speed ramp on the LEFT motor (0 -> 100%) ...")
     enable.on()
     try:
-        for pct in range(20, 61, 10):
+        for pct in range(0, 101, 10):
             left.forward(pct / 100.0)
             print(f"  left at {pct}%")
             time.sleep(1.0)
     finally:
         left.stop()
+        enable.off()
+
+    # Both motors forward together, ramped 0 -> 100%. This is the straight-ahead
+    # full-power check: both should track the same speed and pull evenly.
+    input("\nPress Enter for BOTH motors forward, ramp 0 -> 100% ...")
+    enable.on()
+    try:
+        for pct in range(0, 101, 10):
+            left.forward(pct / 100.0)
+            right.forward(pct / 100.0)
+            print(f"  both at {pct}%")
+            time.sleep(1.0)
+    finally:
+        left.stop()
+        right.stop()
         enable.off()
 
     print("\nResults:")
@@ -104,10 +118,7 @@ def guided(duty, secs):
 
 def manual(duty, secs):
     print(__doc__)
-    if input("Props off and hulls secured? Type 'yes' to continue: ").strip().lower() != "yes":
-        print("Aborting. Secure the boat first.")
-        return
-    print("\nManual mode. Commands (run continuously until you stop them):")
+    print("Manual mode. Commands (run continuously until you stop them):")
     print("  lf / lr   left forward / reverse")
     print("  rf / rr   right forward / reverse")
     print("  ff / bb   both forward / both reverse")
@@ -175,3 +186,5 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+
