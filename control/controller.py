@@ -319,9 +319,14 @@ class Controller:
                 s["yaw_low_since"] = None
                 s["motion_low_since"] = None
 
-            def enter_pivot():
+            def enter_pivot(keep_dir=False):
                 s["pivot_since"] = now
-                s["pivot_dir"] = open_dir
+                # keep_dir: a committed turn finished but the path is STILL blocked
+                # (a corner). Keep rotating the SAME way instead of re-picking from
+                # vision, which at a wall flickers and flipped the turn back and
+                # forth, undoing its own progress (session 091725: 9s, 3deg net).
+                if not keep_dir:
+                    s["pivot_dir"] = open_dir
                 s["yaw_low_since"] = None
                 s["pivot_clear_since"] = None
                 s["turn_swept"] = 0.0          # start the committed-turn heading count
@@ -432,11 +437,20 @@ class Controller:
                     turn_done = swept_deg >= CTL_TURN_MIN_DEG
                     timed_out = pivoting_for > CTL_TURN_MAX_SEC
                     if turn_done or timed_out:
-                        mode = "run"
-                        s["pivot_since"] = None
-                        s["yaw_low_since"] = None
-                        s["pivot_clear_since"] = None
-                        s["cur_ema"] = 0.0; s["cur_base"] = 0.0
+                        if tof_near:
+                            # Still walled after a full 90 (a corner): keep rotating
+                            # the SAME direction for another sweep rather than going
+                            # to run and re-picking a (possibly opposite) direction
+                            # from flickering vision, which made the boat oscillate
+                            # in place. Same-direction continuation always finds the
+                            # opening; reversing into the just-cleared arc never does.
+                            enter_pivot(keep_dir=True)
+                        else:
+                            mode = "run"
+                            s["pivot_since"] = None
+                            s["yaw_low_since"] = None
+                            s["pivot_clear_since"] = None
+                            s["cur_ema"] = 0.0; s["cur_base"] = 0.0
                     else:
                         # only escalate to backup if physically not rotating
                         yaw_stuck = False

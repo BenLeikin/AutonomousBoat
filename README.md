@@ -1,141 +1,167 @@
-# AutonomousBoat
+# AutoBoat
 
-Vision-based autonomous RC boat for swimming pool navigation. Uses a Raspberry Pi 4 with a CSI camera and an I2C IMU to detect obstacles (walls, floating objects, people) and steer around them with differential thrust.
+An autonomous RC catamaran that patrols a backyard pool, avoiding the walls on
+its own. A Raspberry Pi 4B runs the perception, control, and a live web dashboard;
+obstacle avoidance is reactive, driven by a forward time-of-flight rangefinder with
+a camera-based vision pipeline as a steering aid.
 
-## Hardware
+![AutoBoat dashboard](docs/dashboard.png)
 
-- **Raspberry Pi 4 Model B** running Raspberry Pi OS Trixie (64-bit)
-- **Pi Camera v1** (OmniVision OV5647, 5MP, CSI ribbon)
-- **LSM6DSO IMU** (6-axis accel + gyro, I2C address `0x6A`)
-- Hull: AliExpress 2.4G twin-motor RC racing boat, stock electronics replaced
-- Motor driver: TBD (DRV8833 or TB6612FNG)
-- Buck converter: TBD (MP1584EN, 5.1V output)
-- Battery: TBD (2S 7.4V LiPo)
+## What it does
 
-## Software setup
+The boat drives forward under its own control and turns away from obstacles before
+hitting them. The core loop, running on the Pi about 15-30 times a second:
 
-Assumes a fresh Pi OS Trixie install.
+1. **See** — a downward camera segments water from not-water and a forward ToF
+   sensor measures the distance to whatever is ahead.
+2. **Decide** — a small state machine (`assess -> run -> pivot -> backup`) chooses
+   whether to drive, turn in place, or reverse.
+3. **Act** — two motors via a DRV8833 H-bridge, with trim, kickstart, watchdog,
+   and per-mode duty caps.
+4. **Record** — every frame's telemetry, the camera image, and a session manifest
+   are logged for later analysis.
 
-### System packages
+All of this is visible and controllable from a web dashboard on the same network.
 
-```bash
-sudo apt install -y i2c-tools python3-dev python3-picamera2 python3-rpi-lgpio
-sudo raspi-config nonint do_i2c 0
-echo "i2c-dev" | sudo tee -a /etc/modules
-```
+## Why the ToF, not just the camera
 
-### Python environment
+The pool's plaster walls are colour- and texture-matched to the water, and at the
+camera's near-water viewing angle a wall looks identical to open water. This was
+verified exhaustively — a trained patch classifier, edge and mirror-symmetry
+detectors, and a pretrained monocular-depth network all failed to see the wall at
+approach distance, because the distance information simply is not in the pixels at
+this geometry. The camera is therefore used only for **steering** (which way is
+more open); the **ToF** is the obstacle authority, because it measures distance
+directly regardless of how well the wall is camouflaged.
 
-```bash
-cd ~
-python3 -m venv --system-site-packages autoboat-env
-source autoboat-env/bin/activate
-pip install \
-    adafruit-circuitpython-lsm6ds \
-    adafruit-circuitpython-busdevice \
-    adafruit-circuitpython-register \
-    adafruit-platformdetect \
-    Adafruit-PureIO \
-    opencv-python-headless \
-    Pillow
-pip install --no-deps adafruit-blinka
-```
+Measured reality: outdoors the ToF's usable range is about 1.2 m (sunlight washes
+out the infrared), not the 4 m on the spec sheet. The control thresholds are set
+for that.
 
-`--system-site-packages` lets the venv see the apt-installed `picamera2`.
-`--no-deps` on `adafruit-blinka` skips `rpi_ws281x` and `RPi.GPIO` which conflict with the modern `rpi-lgpio` on Trixie. The IMU only uses I2C so neither is needed.
+## Architecture
 
-### Verify
-
-```bash
-source ~/autoboat-env/bin/activate
-python3 -c "from picamera2 import Picamera2; from adafruit_lsm6ds.lsm6dsox import LSM6DSOX; import board, busio; print('ok')"
-```
-
-## Project structure
+The code is split so that the control logic is hardware-free and unit-testable,
+the dashboard is just an HTTP server, and every device lives in its own module.
 
 ```
 autoboat/
-├── sensors/
-│   ├── imu.py              # Threaded LSM6DSO reader, ~100 Hz
-│   └── camera.py           # Threaded Picamera2 wrapper, ~30 fps
-├── vision/
-│   └── pipeline.py         # HSV water segmentation, per-column depth, zone analysis
-├── control/                # (not yet implemented)
-├── scripts/
-│   ├── sensor_rates.py     # Measure achieved IMU + camera rates
-│   ├── capture_pool_images.py  # Capture labeled pool test images
-│   └── test_pipeline.py    # Run vision pipeline on saved images
-├── pool_images/            # Test images of the pool in various conditions
-└── logs/                   # Runtime logs (gitignored)
+  autoboat_dashboard.py   HTTP server: routes, page serving, thread startup
+  pilot.py                camera loop (vision -> controller -> motors), Start/Stop
+  recording.py            session capture, telemetry schema, Analyze-tab readers
+  pipeline.py             vision: water segmentation, depth-per-column, zones
+  control/
+    controller.py         the avoidance brain — pure Python, no hardware imports
+  hardware/
+    bus.py                shared I2C bus handle
+    imu.py                MPU-6050 attitude (roll/pitch/yaw, gyro)
+    motors.py             DRV8833 actuation, trim, watchdog, ARMED flag
+    power.py              INA219 pack monitor, critical-battery shutdown
+    gps.py                VK-162 NMEA reader
+    tof.py                single VL53L1X forward rangefinder
+    tof_array.py          five-VL53L1X array (front / +-45 / +-90)
+    sysmon.py             CPU / memory / wifi / throttle metrics
+  static/
+    index.html            the dashboard web UI
+  test_autoboat_control.py  controller unit tests (run anywhere, no hardware)
+  docs/
+    dashboard.png         dashboard screenshot
 ```
 
-## Running the scripts
+Every hardware module is **optional**: if a device or its library is missing, that
+module reports offline and the rest of the system runs normally. The same property
+makes the controller importable on any machine for testing.
 
-All scripts assume the venv is active and you're running as user `ben` (in the `i2c`, `gpio`, `video` groups).
+### The controller
 
-**Measure sensor rates:**
-```bash
-python3 ~/autoboat/scripts/sensor_rates.py
+`control/controller.py` is the decision-making core, deliberately free of any
+hardware or framework imports so it can be tested and replayed against logged
+sessions. Its modes:
+
+- **assess** — read what's ahead before moving (entered on Start).
+- **run** — drive forward; the camera centroid steers, the ToF gates the path.
+- **pivot** — a committed in-place tank turn. When the ToF blocks, the boat turns
+  until the gyro confirms it has swept at least 90 degrees, then resumes. At a
+  corner it keeps turning the *same* direction rather than oscillating.
+- **backup** — reverse to gain room, used only when physically pinned (gyro says
+  it isn't rotating, or current says it's grinding), not on the camera's opinion.
+
+Stall detection is **relative**: it triggers on a current *rise* above a slow
+baseline (a wall grind pulls 2-3x cruise), so it stays correct even if the absolute
+current reading drifts. With the five-sensor array present, turns become
+**sighted** — the boat turns toward the beam that actually reads open instead of
+guessing from vision.
+
+Key thresholds (see `control/controller.py` for the full annotated list):
+
+| Behaviour            | Value     |
+|----------------------|-----------|
+| ToF block distance   | 0.50 m    |
+| ToF clear (hysteresis)| 0.70 m   |
+| ToF slow zone        | 0.90 m    |
+| Committed turn       | >= 90 deg |
+| Stall trigger (rise) | 700 mA over baseline |
+
+## The dashboard
+
+Open `http://<pi-ip>:8000` from any device on the same network.
+
+- **Live tab** — Start/Stop the autonomous run, live state (mode, throttle, turn,
+  range), motor command bars, camera view with the vision overlay, and system
+  cards (IMU rate, CPU, memory, battery, Pi 5V rail).
+- **Analyze tab** — browse recorded sessions, scrub frames, re-run the vision
+  pipeline on saved frames, and chart telemetry.
+
+The page is served from `static/index.html`, so UI edits only need a browser
+refresh — no service restart.
+
+## Hardware
+
+| Part            | Interface          | Notes |
+|-----------------|--------------------|-------|
+| Raspberry Pi 4B | —                  | brain, runs everything |
+| OV5647 camera   | CSI                | downward water segmentation |
+| MPU-6050        | I2C bus 1 (0x68)   | heading for committed turns |
+| INA219          | I2C bus 3 (0x40)   | pack voltage / current |
+| VL53L1X ToF     | I2C bus 5 (0x29)   | forward range — the obstacle authority |
+| 5x VL53L1X array| I2C bus 5 (0x2a-2e)| front / +-45 / +-90, sighted turns (optional upgrade) |
+| DRV8833         | GPIO 17/27/22/23/24| dual motor driver |
+| VK-162 GPS      | USB                | logged only; too coarse to navigate a pool |
+| 2S LiPo         | —                  | power |
+
+Wiring diagrams are generated by `make_wiring.py` (base system) and
+`make_array_wiring.py` (the five-sensor ToF array).
+
+## Running it
+
+The dashboard runs as a systemd service (`autoboat-dashboard`) started at boot:
+
 ```
-Runs both sensors for 5 seconds and reports actual achieved Hz/fps.
-
-**Capture pool test images:**
-```bash
-python3 ~/autoboat/scripts/capture_pool_images.py
+sudo systemctl restart autoboat-dashboard      # after deploying code
+journalctl -u autoboat-dashboard -f            # watch the logs
 ```
-Interactive. Prompts for a label, captures a frame, writes a timestamped JPEG to `pool_images/`.
 
-**Run the vision pipeline on saved images:**
-```bash
-python3 ~/autoboat/scripts/test_pipeline.py
+To run the controller tests (no hardware required):
+
 ```
-Analyzes every JPEG in `pool_images/` and writes annotated output to `pool_images/analyzed/`.
+python3 test_autoboat_control.py
+```
 
-## Vision pipeline output
+## Development notes
 
-The pipeline returns a `NavResult` for each frame:
-
-- `mask`: binary water mask
-- `depths`: per-column free-water depth in pixels (length = frame width)
-- `zones`: 5 horizontal zones with median water depth, left to right
-- `best_zone`: zone index (0-4) with the most open water
-- `center_depth_pct`: free water ahead in the center column, as % of frame height
-
-Steering logic (when implemented): turn toward `best_zone`, reduce speed when `center_depth_pct` drops below a threshold.
-
-## Sensor architecture
-
-Both sensors run in their own thread with a "latest sample wins" pattern. Consumers call `latest()` and get the most recent reading. No queues, no locks.
-
-- IMU: ~100 Hz, sample age < 10 ms
-- Camera: ~32 fps at 320x240, frame age < 32 ms
-
-Verified via `scripts/sensor_rates.py`.
+- **Deploying:** the running Python holds the old code until the service restarts —
+  always restart after copying. The session manifest records the live controller
+  parameters, so checking a fresh manifest confirms the new code is actually
+  running.
+- **UI changes** only need a browser refresh (the page is served from disk).
+- **Replaying sessions:** the controller is pure Python, so logged telemetry can be
+  fed back through it to test changes. This is exact only for changes that don't
+  alter the trajectory; behaviour changes still need a real water run to confirm.
 
 ## Status
 
-Working:
-- Camera detected and streaming via Picamera2
-- IMU detected, reading clean accel + gyro
-- Threaded sensor layer hits target rates
-- Vision pipeline correctly identifies water vs obstacles in cloudy outdoor light
-
-Not yet implemented:
-- Motor driver hardware and software
-- Control loop
-- Live demo (pipeline against the threaded camera in real time)
-- Sunny-condition HSV recalibration
-- Temporal smoothing on steering output
-- Distance calibration (pixel rows -> meters)
-- Hardware watchdog for motor cutoff on control hang
-- Waterproof enclosure
-
-## Calibration notes
-
-HSV thresholds in `vision/pipeline.py` are tuned for the OV5647 under cloudy evening light. The camera's auto white balance produces an olive-green color cast for clear pool water (visible in `pool_images/`). Thresholds are matched to what the camera actually outputs, not what the water looks like to the eye.
-
-When lighting changes significantly (midday sun, indoor), recalibration via pixel sampling from new images is needed. Use `analyze_water.py`-style sampling to get new percentile ranges.
-
-## License
-
-Personal project. No license specified.
+Reactive wall avoidance works well: in the latest runs the boat spends about
+two-thirds of its time driving forward, turns decisively when it meets a wall, and
+rarely if ever needs to reverse. The current focus is the five-sensor ToF array,
+which makes turns sighted (turn toward the open side) and gives awareness of walls
+to the sides during a maneuver — the main remaining limitation of the single
+forward beam.

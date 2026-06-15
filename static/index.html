@@ -144,10 +144,7 @@
   <div class="card"><div class="k">POWER</div><div class="v" id="pw_w">--</div></div>
   <div class="card"><div class="k">RAIL</div><div class="v" id="pw_rail">--</div></div>
 </div>
-<div class="status" id="m_power" style="display:flex;justify-content:space-between;align-items:center;gap:10px">
-  <span id="m_power_txt">power: --</span>
-  <span id="m_power_x" style="display:none;cursor:pointer;font-weight:bold;padding:0 6px" title="dismiss until this changes">&#10005;</span>
-</div>
+
 <div class="ctrl-status" id="pw_status">pack --</div>
 
 <h2>Capture</h2>
@@ -858,35 +855,12 @@ async function sysTick(){
   else set('m_wifi', d.wifi_dbm+'<small> dBm ('+d.wifi_pct+'%)</small>',
            d.wifi_dbm<=-78?'#d9534f':d.wifi_dbm<=-67?'#d9b13a':'#e6eef2');
   set('m_ip', d.ip? '<small>'+d.ip+'</small>' : '--', '#e6eef2');
-  // PI 5V card: the always-visible compact truth about the rail
+  // PI 5V card: the compact rail status, kept in the system grid.
   if(d.under_voltage) set('m_5v','SAG','#d9534f');
   else if(d.throttled_now) set('m_5v','THROTTLED','#d9b13a');
   else if(d.uv_occurred) set('m_5v','dipped','#d9b13a');
   else if(d.under_voltage===false) set('m_5v','OK','#3fd0a8');
   else set('m_5v','--','#7d96a3');
-  // Banner: same message, but dismissible. Dismiss is keyed to the condition,
-  // so if the rail recovers and then sags again, that's new info and it re-fires.
-  const pw=document.getElementById('m_power');
-  const pwt=document.getElementById('m_power_txt');
-  const pwx=document.getElementById('m_power_x');
-  let cond='unknown', msg='POWER: vcgencmd unavailable (cannot read rail state).';
-  let fg='#7d96a3', bg='', bd='';
-  if(d.under_voltage){ cond='uv_now'; msg='POWER: undervoltage now - the Pi 5V rail is sagging under load. Expect resets and SD corruption; check the supply.';
-    fg='#fff'; bg='#7a1f1f'; bd='#d9534f'; }
-  else if(d.throttled_now){ cond='thr_now'; msg='POWER: throttled now - CPU has clocked down to cope with low voltage.';
-    fg='#f0c067'; bg='#0c1014'; bd='#d9b13a'; }
-  else if(d.uv_occurred){ cond='uv_past'; msg='POWER: undervoltage occurred earlier this session - the rail dipped at least once since boot. Stable now.';
-    fg='#d9b13a'; bg='#0c1014'; bd='#3a3320'; }
-  else if(d.under_voltage===false){ cond='ok'; msg='POWER: OK - 5V rail stable, no throttling.';
-    fg='#3fd0a8'; bg='#0c1014'; bd='#1b2530'; }
-  if(window._pwDismissed && window._pwDismissed!==cond) window._pwDismissed=null;  // condition changed: undismiss
-  const warn = (cond==='uv_now'||cond==='thr_now'||cond==='uv_past');
-  if(warn && window._pwDismissed===cond){ pw.style.display='none'; return; }
-  pw.style.display='flex';
-  pwt.textContent=msg;
-  pw.style.color=fg; pw.style.background=bg; pw.style.borderColor=bd;
-  pwx.style.display = warn ? 'inline' : 'none';
-  pwx.onclick = ()=>{ window._pwDismissed=cond; pw.style.display='none'; };
 }
 async function powerTick(){
   let d;
